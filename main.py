@@ -183,6 +183,13 @@ try:
 except FileNotFoundError:
     st.error("sales.csv 파일을 찾을 수 없어요. main.py와 같은 폴더(저장소)에 올렸는지 확인해 주세요.")
     st.stop()
+except pd.errors.EmptyDataError:
+    size = os.path.getsize(DATA_PATH) if os.path.exists(DATA_PATH) else 0
+    st.error(
+        f"sales.csv 파일은 있지만 내용이 비어 있어요 (현재 크기: {size:,} 바이트). "
+        "GitHub 저장소에서 sales.csv를 다시 올려 주세요. 원본은 약 17MB(17,323,614바이트)예요."
+    )
+    st.stop()
 except UnicodeDecodeError:
     st.error("sales.csv를 cp949로 읽지 못했어요. 파일이 바뀌지 않았는지 확인해 주세요.")
     st.stop()
