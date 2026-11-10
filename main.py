@@ -33,6 +33,7 @@ DATA_DIR = os.path.join(BASE_DIR, "sales.csv")
 RECORD_DIR = os.path.join(BASE_DIR, "내_기록")
 INTRO_JSON = os.path.join(RECORD_DIR, "데이터소개.json")
 EXPLORE_JSON = os.path.join(RECORD_DIR, "데이터탐색.json")
+LABEL_JSON = os.path.join(RECORD_DIR, "라벨만들기.json")
 
 
 # ============================================================
@@ -529,6 +530,252 @@ def page_explore(df):
 
 
 # ============================================================
+# 3. 라벨 만들기 (성장여부)
+# ============================================================
+
+@st.cache_data
+def make_label_data(df):
+    """
+    '직전 분기 대비 당월_매출_금액이 늘었는가'를 나타내는 성장여부(1/0) 열을 만든다.
+
+    일부 (자치구, 업종) 조합은 중간 분기가 비어 있어서 shift를 쓰면
+    '한 줄 위'가 직전 분기가 아닐 수 있다. 그래서 분기 코드를 연속 번호로
+    바꾼 뒤, 연속 번호가 정확히 1 작은 행을 merge로 붙여서 직전 분기 매출을 가져온다.
+
+    돌려주는 값: (라벨 붙은 데이터, 통계 딕셔너리)
+    """
+
+    keys = ["자치구_코드", "서비스_업종_코드"]
+
+    work = df.copy()
+
+    # 분기 코드를 연속 번호로 바꾸기: 연도 × 4 + 분기 (20262 -> 2026 × 4 + 2)
+    work["분기번호"] = (
+        (work["기준_년분기_코드"] // 10) * 4
+        + (work["기준_년분기_코드"] % 10)
+    )
+
+    # (분기, 자치구, 업종)이 겹치는 행이 있으면 merge할 때 행이 늘어나므로 미리 제거
+    dup_count = int(work.duplicated(subset=keys + ["분기번호"]).sum())
+
+    if dup_count > 0:
+        work = work.drop_duplicates(
+            subset=keys + ["분기번호"],
+            keep="first"
+        )
+
+    total_rows = len(work)
+
+    # 직전 분기 매출 표 만들기: 분기번호에 1을 더해서
+    # '다음 분기 행'과 짝이 맞도록 옮겨 둔다
+    prev = work[keys + ["분기번호", "당월_매출_금액"]].copy()
+    prev["분기번호"] = prev["분기번호"] + 1
+    prev = prev.rename(
+        columns={"당월_매출_금액": "직전분기_매출_금액"}
+    )
+
+    # merge: 같은 자치구·업종이면서 분기번호가 정확히 1 작은 행을 붙인다
+    merged = work.merge(
+        prev,
+        on=keys + ["분기번호"],
+        how="left"
+    )
+
+    has_prev = merged["직전분기_매출_금액"].notna()
+
+    # 제외할 행: 직전 분기 행이 없는 행
+    excluded_total = int((~has_prev).sum())
+    first_quarter_no = work["분기번호"].min()
+    excluded_first = int(
+        ((~has_prev) & (merged["분기번호"] == first_quarter_no)).sum()
+    )
+
+    labeled = merged[has_prev].copy()
+
+    # 당월 매출이 직전 분기보다 크면 1(성장), 아니면 0(하락 또는 같음)
+    labeled["성장여부"] = (
+        labeled["당월_매출_금액"] > labeled["직전분기_매출_금액"]
+    ).astype(int)
+
+    labeled = labeled.reset_index(drop=True)
+
+    stats = {
+        "total_rows": total_rows,
+        "excluded_total": excluded_total,
+        "excluded_first": excluded_first,
+        "excluded_gap": excluded_total - excluded_first,
+        "remaining_rows": len(labeled),
+        "dup_removed": dup_count,
+    }
+
+    return labeled, stats
+
+
+def page_label(df):
+
+    # 처음 한 번만 저장된 해석 메모 불러오기
+    if "label_note" not in st.session_state:
+
+        st.session_state["label_note"] = load_note(LABEL_JSON)
+
+    st.subheader("3. 라벨 만들기")
+
+    st.write(
+        "맞히고 싶은 정답(라벨)은 **'직전 분기보다 매출이 늘었는가'** 예요. "
+        "당월 매출이 직전 분기 매출보다 크면 **1(성장)**, "
+        "아니면 **0(하락 또는 같음)** 으로 표시해요."
+    )
+
+    st.caption(
+        "일부 (자치구, 업종)은 중간 분기가 비어 있어서, 바로 윗줄을 직전 분기로 쓰지 않고 "
+        "분기 번호(연도 × 4 + 분기)가 정확히 1 작은 행을 찾아서 연결했어요."
+    )
+
+    labeled, stats = make_label_data(df)
+
+    if stats["dup_removed"] > 0:
+
+        st.warning(
+            f"(분기, 자치구, 업종)이 겹치는 행 {stats['dup_removed']:,}개를 "
+            "먼저 제거했어요. 같은 CSV가 두 번 들어 있지 않은지 확인해 보세요."
+        )
+
+    # --------------------------------------------------------
+    # 제외한 행 수와 남은 행 수
+    # --------------------------------------------------------
+
+    st.markdown("### 제외한 행 수와 남은 행 수")
+
+    cols = st.columns(3)
+
+    big_card(cols[0], "전체 행 수", f"{stats['total_rows']:,}")
+    big_card(cols[1], "제외한 행 수", f"{stats['excluded_total']:,}")
+    big_card(cols[2], "남은 행 수", f"{stats['remaining_rows']:,}")
+
+    st.caption(
+        f"제외한 {stats['excluded_total']:,}행 중 "
+        f"가장 첫 분기라서 비교할 직전 분기가 없는 행이 {stats['excluded_first']:,}개, "
+        f"중간 분기가 비어 있어서 직전 분기를 찾지 못한 행이 {stats['excluded_gap']:,}개예요."
+    )
+
+    # --------------------------------------------------------
+    # 라벨을 붙인 데이터 처음 다섯 줄
+    # --------------------------------------------------------
+
+    st.markdown("### 라벨을 붙인 데이터 처음 다섯 줄")
+
+    st.caption("보기 쉽도록 핵심 열만 보여 줘요. (실제 데이터에는 나머지 열도 모두 들어 있어요.)")
+
+    show_cols = [
+        "기준_년분기_코드",
+        "자치구_코드_명",
+        "서비스_업종_코드_명",
+        "직전분기_매출_금액",
+        "당월_매출_금액",
+        "성장여부",
+    ]
+
+    st.dataframe(
+        labeled[show_cols].head(5),
+        hide_index=True,
+    )
+
+    # --------------------------------------------------------
+    # 전체 성장 비율
+    # --------------------------------------------------------
+
+    st.markdown("### 전체 성장 비율")
+
+    growth_count = int((labeled["성장여부"] == 1).sum())
+    fall_count = int((labeled["성장여부"] == 0).sum())
+    overall_ratio = labeled["성장여부"].mean()
+
+    cols = st.columns(3)
+
+    big_card(cols[0], "성장(1) 비율", f"{overall_ratio * 100:.1f}%")
+    big_card(cols[1], "성장(1) 행 수", f"{growth_count:,}")
+    big_card(cols[2], "하락·같음(0) 행 수", f"{fall_count:,}")
+
+    # --------------------------------------------------------
+    # 예측 대상 분기별 성장 비율 막대 그래프
+    # --------------------------------------------------------
+
+    st.markdown("### 예측 대상 분기별 성장 비율")
+
+    by_quarter = (
+        labeled.groupby("기준_년분기_코드", as_index=False)["성장여부"]
+        .mean()
+    )
+    by_quarter["분기"] = by_quarter["기준_년분기_코드"].map(quarter_label)
+    by_quarter["성장 비율(%)"] = by_quarter["성장여부"] * 100
+    by_quarter["계절"] = (by_quarter["기준_년분기_코드"] % 10).astype(str) + "분기"
+
+    quarter_labels = [
+        quarter_label(c)
+        for c in sorted(by_quarter["기준_년분기_코드"].unique())
+    ]
+
+    fig = px.bar(
+        by_quarter,
+        x="분기",
+        y="성장 비율(%)",
+        color="계절",
+        category_orders={"계절": ["1분기", "2분기", "3분기", "4분기"]},
+    )
+    fig.update_xaxes(
+        type="category",
+        categoryorder="array",
+        categoryarray=quarter_labels,
+        tickangle=-45,
+        title_text="예측 대상 분기",
+    )
+    fig.update_yaxes(
+        range=[0, 100],
+        title_text="성장 비율(%)",
+    )
+    fig.update_traces(
+        texttemplate="%{y:.0f}",
+        textposition="outside",
+        hovertemplate="%{x}<br>%{y:.1f}%<extra></extra>",
+    )
+    # 전체 평균선
+    fig.add_hline(
+        y=overall_ratio * 100,
+        line_dash="dash",
+        annotation_text=f"전체 평균 {overall_ratio * 100:.1f}%",
+    )
+
+    st.plotly_chart(fig)
+
+    st.caption("막대 색은 예측 대상 분기가 1~4분기 중 어느 분기인지를 뜻해요.")
+
+    # --------------------------------------------------------
+    # 내 해석
+    # --------------------------------------------------------
+
+    st.markdown("### 내 해석")
+
+    st.text_area(
+        "그래프를 보고 알게 된 점과 생각을 적어 주세요.",
+        key="label_note",
+        height=150,
+        placeholder="예: 분기에 따라 성장 비율이 크게 달라진다.",
+    )
+
+    if st.button(
+        "해석 저장",
+        key="save_label_note"
+    ):
+
+        if save_record(
+            {"note": st.session_state["label_note"]},
+            LABEL_JSON,
+        ):
+
+            st.success("해석을 저장했어요.")
+
+
+# ============================================================
 # 앱 실행 부분
 # ============================================================
 
@@ -616,6 +863,7 @@ except Exception as e:
 PAGES = {
     "1. 데이터 소개": page_intro,
     "2. 데이터 탐색": page_explore,
+    "3. 라벨 만들기": page_label,
 }
 
 st.sidebar.title(
