@@ -1,9 +1,9 @@
-
 import json
 import os
 import glob
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 
@@ -32,6 +32,7 @@ DATA_DIR = os.path.join(BASE_DIR, "sales.csv")
 # 사용자 기록 저장 폴더
 RECORD_DIR = os.path.join(BASE_DIR, "내_기록")
 INTRO_JSON = os.path.join(RECORD_DIR, "데이터소개.json")
+EXPLORE_JSON = os.path.join(RECORD_DIR, "데이터탐색.json")
 
 
 # ============================================================
@@ -149,7 +150,7 @@ def load_record():
     return record
 
 
-def save_record(record):
+def save_record(record, path=INTRO_JSON):
     """기록을 JSON 파일로 저장한다."""
 
     try:
@@ -158,7 +159,7 @@ def save_record(record):
             exist_ok=True
         )
 
-        with open(INTRO_JSON, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
 
             json.dump(
                 record,
@@ -341,6 +342,192 @@ def page_intro(df):
             st.success("출처를 저장했어요.")
 
 
+def load_note(path):
+    """json에 저장된 관찰 메모(note)를 글자로 돌려준다. 없거나 깨져 있으면 빈 글자."""
+
+    if os.path.exists(path):
+
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+
+            if isinstance(loaded, dict) and isinstance(loaded.get("note"), str):
+                return loaded["note"]
+
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return ""
+
+
+# ============================================================
+# 2. 데이터 탐색 화면
+# ============================================================
+
+def page_explore(df):
+
+    # 처음 한 번만 저장된 관찰 메모 불러오기
+    if "explore_note" not in st.session_state:
+
+        st.session_state["explore_note"] = load_note(EXPLORE_JSON)
+
+    st.subheader("2. 데이터 탐색")
+
+    st.write(
+        "매출이 시간에 따라 어떻게 움직이는지, "
+        "업종마다 어떻게 다른지 그래프로 살펴봐요. "
+        "(금액은 원 단위 합계를 조 원·억 원으로 바꿔서 보여 줘요.)"
+    )
+
+    # 분기 코드를 작은 순서대로 정렬하고, 그래프 축에 쓸 글자 목록을 만든다
+    quarter_codes = sorted(df["기준_년분기_코드"].unique())
+    quarter_labels = [quarter_label(c) for c in quarter_codes]
+
+    # --------------------------------------------------------
+    # 그래프 1) 분기별 전체 매출 합계
+    # --------------------------------------------------------
+
+    st.markdown("### 1) 분기별 전체 매출 합계")
+
+    total = (
+        df.groupby("기준_년분기_코드", as_index=False)["당월_매출_금액"]
+        .sum()
+    )
+    total["분기"] = total["기준_년분기_코드"].map(quarter_label)
+    total["매출 합계(조 원)"] = total["당월_매출_금액"] / 1e12
+
+    fig1 = px.line(
+        total,
+        x="분기",
+        y="매출 합계(조 원)",
+        markers=True,
+    )
+    fig1.update_xaxes(
+        type="category",
+        categoryorder="array",
+        categoryarray=quarter_labels,
+        tickangle=-45,
+        title_text="분기",
+    )
+    fig1.update_yaxes(title_text="매출 합계(조 원)")
+    fig1.update_traces(
+        hovertemplate="%{x}<br>%{y:,.2f}조 원<extra></extra>"
+    )
+
+    st.plotly_chart(fig1)
+
+    # --------------------------------------------------------
+    # 그래프 2) 업종을 골라서 보는 분기별 매출 합계
+    # --------------------------------------------------------
+
+    st.markdown("### 2) 업종별 분기 매출 합계")
+
+    # 전체 기간 매출이 가장 큰 업종을 처음에 선택된 상태로 둔다
+    industry_total = (
+        df.groupby("서비스_업종_코드_명")["당월_매출_금액"]
+        .sum()
+        .sort_values(ascending=False)
+    )
+    industries = sorted(industry_total.index)
+
+    selected = st.selectbox(
+        "업종 선택",
+        industries,
+        index=industries.index(industry_total.index[0]),
+        key="explore_industry",
+    )
+
+    by_quarter = (
+        df[df["서비스_업종_코드_명"] == selected]
+        .groupby("기준_년분기_코드", as_index=False)["당월_매출_금액"]
+        .sum()
+    )
+    by_quarter["분기"] = by_quarter["기준_년분기_코드"].map(quarter_label)
+    by_quarter["매출 합계(억 원)"] = by_quarter["당월_매출_금액"] / 1e8
+
+    fig2 = px.line(
+        by_quarter,
+        x="분기",
+        y="매출 합계(억 원)",
+        markers=True,
+        title=f"{selected}의 분기별 매출 합계",
+    )
+    fig2.update_xaxes(
+        type="category",
+        categoryorder="array",
+        categoryarray=quarter_labels,
+        tickangle=-45,
+        title_text="분기",
+    )
+    fig2.update_yaxes(title_text="매출 합계(억 원)")
+    fig2.update_traces(
+        hovertemplate="%{x}<br>%{y:,.0f}억 원<extra></extra>"
+    )
+
+    st.plotly_chart(fig2)
+
+    # --------------------------------------------------------
+    # 그래프 3) 가장 최근 분기의 매출 상위 10개 업종
+    # --------------------------------------------------------
+
+    latest = df["기준_년분기_코드"].max()
+
+    st.markdown(f"### 3) {quarter_label(latest)} 매출 상위 10개 업종")
+
+    top10 = (
+        df[df["기준_년분기_코드"] == latest]
+        .groupby("서비스_업종_코드_명", as_index=False)["당월_매출_금액"]
+        .sum()
+        .nlargest(10, "당월_매출_금액")
+    )
+    top10["매출 합계(억 원)"] = top10["당월_매출_금액"] / 1e8
+
+    fig3 = px.bar(
+        top10,
+        x="매출 합계(억 원)",
+        y="서비스_업종_코드_명",
+        orientation="h",
+    )
+    # 매출이 큰 업종이 맨 위에 오도록 정렬
+    fig3.update_yaxes(
+        categoryorder="total ascending",
+        title_text="업종",
+    )
+    fig3.update_xaxes(title_text="매출 합계(억 원)")
+    fig3.update_traces(
+        texttemplate="%{x:,.0f}",
+        textposition="outside",
+        hovertemplate="%{y}<br>%{x:,.0f}억 원<extra></extra>",
+    )
+
+    st.plotly_chart(fig3)
+
+    # --------------------------------------------------------
+    # 내가 관찰한 점
+    # --------------------------------------------------------
+
+    st.markdown("### 내가 관찰한 점")
+
+    st.text_area(
+        "그래프를 보고 알게 된 점을 적어 주세요.",
+        key="explore_note",
+        height=150,
+        placeholder="예: 매년 4분기에 매출이 높아지는 모양이 보인다.",
+    )
+
+    if st.button(
+        "관찰 저장",
+        key="save_explore_note"
+    ):
+
+        if save_record(
+            {"note": st.session_state["explore_note"]},
+            EXPLORE_JSON,
+        ):
+
+            st.success("관찰한 점을 저장했어요.")
+
+
 # ============================================================
 # 앱 실행 부분
 # ============================================================
@@ -428,6 +615,7 @@ except Exception as e:
 
 PAGES = {
     "1. 데이터 소개": page_intro,
+    "2. 데이터 탐색": page_explore,
 }
 
 st.sidebar.title(
@@ -440,4 +628,3 @@ menu = st.sidebar.radio(
 )
 
 PAGES[menu](data)
-
