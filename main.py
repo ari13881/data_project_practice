@@ -127,7 +127,7 @@ def quarter_label(code):
 
 
 def load_record():
-    """저장된 JSON 기록을 불러온다."""
+    """저장된 JSON 기록(출처)을 불러온다."""
 
     record = {}
 
@@ -142,9 +142,6 @@ def load_record():
 
         except (json.JSONDecodeError, OSError):
             record = {}
-
-    if not isinstance(record.get("meanings"), dict):
-        record["meanings"] = {}
 
     if not isinstance(record.get("source"), str):
         record["source"] = ""
@@ -179,9 +176,9 @@ def save_record(record):
         return False
 
 
-def build_column_table(df, meanings):
+def build_column_table(df):
     """
-    열 이름, 우리말 뜻, 값의 종류, 빈 값 개수 표를 만든다.
+    열 이름, 값의 종류, 빈 값 개수 표를 만든다.
     """
 
     rows = []
@@ -196,7 +193,6 @@ def build_column_table(df, meanings):
 
         rows.append({
             "열 이름": col,
-            "우리말 뜻": meanings.get(col, ""),
             "값의 종류": (
                 f"{kind} · 서로 다른 값 "
                 f"{df[col].nunique():,}종류"
@@ -238,11 +234,6 @@ def page_intro(df):
         record = load_record()
 
         st.session_state["intro_record"] = record
-
-        st.session_state["meaning_base"] = build_column_table(
-            df,
-            record["meanings"]
-        )
 
         st.session_state["source_text"] = record["source"]
 
@@ -301,74 +292,16 @@ def page_intro(df):
     )
 
     # --------------------------------------------------------
-    # 열 설명 표
+    # 열 설명 표 (열 이름 · 값의 종류 · 빈 값 개수)
     # --------------------------------------------------------
 
     st.markdown("### 열 설명 표")
 
-    st.caption(
-        "'우리말 뜻' 칸은 비어 있어요. "
-        "칸을 더블클릭해서 직접 적고, "
-        "아래 저장 버튼을 눌러 주세요."
-    )
-
-    edited = st.data_editor(
-        st.session_state["meaning_base"],
-        key="meaning_editor",
+    st.dataframe(
+        build_column_table(df),
         hide_index=True,
         height=600,
-
-        disabled=[
-            "열 이름",
-            "값의 종류",
-            "빈 값 개수"
-        ],
-
-        column_config={
-
-            "열 이름": st.column_config.TextColumn(
-                "열 이름"
-            ),
-
-            "우리말 뜻": st.column_config.TextColumn(
-                "우리말 뜻",
-                help="직접 적어 넣는 칸"
-            ),
-
-            "값의 종류": st.column_config.TextColumn(
-                "값의 종류"
-            ),
-
-            "빈 값 개수": st.column_config.NumberColumn(
-                "빈 값 개수",
-                format="%d"
-            ),
-        },
     )
-
-    # 우리말 뜻 저장
-    if st.button(
-        "우리말 뜻 저장",
-        key="save_meanings"
-    ):
-
-        meanings = {}
-
-        for _, row in edited.iterrows():
-
-            text = row["우리말 뜻"]
-
-            if isinstance(text, str) and text.strip():
-
-                meanings[row["열 이름"]] = text.strip()
-
-        record["meanings"] = meanings
-
-        if save_record(record):
-
-            st.success(
-                f"우리말 뜻 {len(meanings)}개를 저장했어요."
-            )
 
     # --------------------------------------------------------
     # 데이터 처음 다섯 줄
@@ -507,5 +440,4 @@ menu = st.sidebar.radio(
 )
 
 PAGES[menu](data)
-
 
