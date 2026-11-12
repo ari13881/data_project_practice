@@ -6,6 +6,8 @@ import glob
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 # ============================================================
@@ -35,6 +37,13 @@ RECORD_DIR = os.path.join(BASE_DIR, "내_기록")
 INTRO_JSON = os.path.join(RECORD_DIR, "데이터소개.json")
 EXPLORE_JSON = os.path.join(RECORD_DIR, "데이터탐색.json")
 LABEL_JSON = os.path.join(RECORD_DIR, "라벨만들기.json")
+
+# 시간 순서 분할 기준 (예측 대상 분기 코드)
+TRAIN_LAST_QUARTER = 20252                      # 학습용: 이 분기 이하
+VALID_QUARTERS = [20253, 20254, 20261, 20262]   # 검증용: 네 계절이 한 번씩 들어가게 고른 4개 분기
+
+# 숫자가 아니라 '범주'로 다룰 입력 변수 (나머지는 숫자 변수)
+CATEGORY_FEATURES = ["서비스_업종_코드_명", "자치구_코드_명", "계절_번호"]
 
 
 # ============================================================
@@ -1151,6 +1160,367 @@ def page_features(df):
 
 
 # ============================================================
+# 5. 데이터 나누기와 전처리
+# ============================================================
+
+@st.cache_data
+def split_train_valid(df):
+    """
+    4단계 데이터를 시간 순서로 학습용/검증용으로 나눈다. (무작위로 섞지 않는다)
+    - 학습용: 예측 대상 분기가 TRAIN_LAST_QUARTER(20252) 이하인 행
+    - 검증용: 예측 대상 분기가 VALID_QUARTERS(20253, 20254, 20261, 20262)인 행
+
+    돌려주는 값: 딕셔너리 (X_train, X_valid, y_train, y_valid, 열 목록, 요약 표 등)
+    """
+
+    result = make_feature_data(df)
+    data = result["data"]
+    feature_cols = result["feature_cols"]
+
+    categorical_cols = [c for c in CATEGORY_FEATURES if c in feature_cols]
+    numeric_cols = [c for c in feature_cols if c not in categorical_cols]
+
+    quarter = data["기준_년분기_코드"]
+
+    # 시간 순서 기준으로 행 고르기
+    is_train = quarter <= TRAIN_LAST_QUARTER
+    is_valid = quarter.isin(VALID_QUARTERS)
+
+    X = data[feature_cols].copy()
+
+    # 계절 번호는 크기의 의미가 없는 범주이므로 글자('1분기' 등)로 바꿔서 범주로 다룬다
+    if "계절_번호" in X.columns:
+        X["계절_번호"] = X["계절_번호"].astype(str) + "분기"
+
+    X_train = X[is_train].reset_index(drop=True)
+    X_valid = X[is_valid].reset_index(drop=True)
+    y_train = data.loc[is_train, "성장여부"].reset_index(drop=True)
+    y_valid = data.loc[is_valid, "성장여부"].reset_index(drop=True)
+    q_train = quarter[is_train].reset_index(drop=True)
+    q_valid = quarter[is_valid].reset_index(drop=True)
+
+    # 요약 표 (학습용/검증용 행 수와 성장 비율)
+    summary_rows = []
+
+    for name, q, y in [("학습용", q_train, y_train), ("검증용", q_valid, y_valid)]:
+
+        summary_rows.append(
+            {
+                "구분": name,
+                "예측 대상 분기": f"{quarter_label(q.min())} ~ {quarter_label(q.max())}",
+                "행 수": len(y),
+                "성장(1) 행 수": int(y.sum()),
+                "성장 비율(%)": float(y.mean() * 100),
+            }
+        )
+
+    summary = pd.DataFrame(summary_rows)
+
+    # 검증용 분기별 행 수와 성장 비율
+    valid_by_quarter = (
+        pd.DataFrame({"분기코드": q_valid, "성장여부": y_valid})
+        .groupby("분기코드", as_index=False)["성장여부"]
+        .agg(["count", "mean"])
+    )
+    valid_by_quarter.columns = ["분기코드", "행 수", "성장 비율(%)"]
+    valid_by_quarter["성장 비율(%)"] = valid_by_quarter["성장 비율(%)"] * 100
+    valid_by_quarter.insert(
+        0, "예측 대상 분기", valid_by_quarter["분기코드"].map(quarter_label)
+    )
+    valid_by_quarter = valid_by_quarter.drop(columns="분기코드")
+
+    # 점검 결과
+    checks = {
+        "time_order_ok": bool(q_train.max() < q_valid.min()),
+        "no_overlap_ok": int((is_train & is_valid).sum()) == 0,
+        "all_used_ok": len(X_train) + len(X_valid) == len(data),
+        "valid_quarters_ok": sorted(q_valid.unique()) == sorted(VALID_QUARTERS),
+    }
+
+    return {
+        "X_train": X_train,
+        "X_valid": X_valid,
+        "y_train": y_train,
+        "y_valid": y_valid,
+        "q_train": q_train,
+        "q_valid": q_valid,
+        "numeric_cols": numeric_cols,
+        "categorical_cols": categorical_cols,
+        "summary": summary,
+        "valid_by_quarter": valid_by_quarter,
+        "checks": checks,
+    }
+
+
+def build_preprocessor(numeric_cols, categorical_cols):
+    """
+    전처리기(ColumnTransformer)를 만든다. (아직 fit하지 않은 상태)
+    - 숫자 변수: StandardScaler (평균 0, 표준편차 1로 맞춤)
+    - 범주 변수(업종, 자치구, 계절 번호): OneHotEncoder
+      (검증용에만 있는 새 범주가 나와도 오류 대신 0으로 처리: handle_unknown="ignore")
+
+    6단계에서는 이 함수로 만든 전처리기를 모델과 Pipeline으로 연결해서 쓴다.
+    """
+
+    return ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), numeric_cols),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols),
+        ]
+    )
+
+
+@st.cache_data
+def preprocess_split(df):
+    """
+    시간 순서로 나눈 데이터에 전처리를 적용한다.
+
+    [데이터 누수 방지 규칙]
+    전처리기는 반드시 '학습용 데이터로만' fit한다.
+    검증용 데이터에는 transform만 적용하고, 절대 fit하지 않는다.
+    (검증용 정보로 평균·표준편차·범주 목록을 정하면 미래 정보가 새어 들어간다.)
+    """
+
+    split = split_train_valid(df)
+
+    pre = build_preprocessor(split["numeric_cols"], split["categorical_cols"])
+
+    # ★ 학습용 데이터로만 fit (평균, 표준편차, 범주 목록을 학습용에서만 배운다)
+    X_train_t = pre.fit_transform(split["X_train"])
+
+    # ★ 검증용에는 transform만 적용 (fit 금지)
+    X_valid_t = pre.transform(split["X_valid"])
+
+    return {
+        **split,
+        "preprocessor": pre,
+        "X_train_t": X_train_t,
+        "X_valid_t": X_valid_t,
+        "feature_names": list(pre.get_feature_names_out()),
+    }
+
+
+def page_split(df):
+
+    st.subheader("5. 데이터 나누기")
+
+    st.write(
+        "모델을 학습시킬 **학습용**과, 학습에 쓰지 않은 데이터로 성능을 재는 **검증용**으로 나눠요. "
+        "시간이 있는 데이터라서 무작위로 섞지 않고 **시간 순서**로 나눠요. "
+        "과거로 배우고 이후 분기를 맞히는, 실제 예측과 같은 상황을 만들기 위해서예요."
+    )
+
+    st.info(
+        f"학습용: 예측 대상 분기가 {quarter_label(TRAIN_LAST_QUARTER)} 이하인 행\n\n"
+        f"검증용: 예측 대상 분기가 "
+        f"{', '.join(quarter_label(q) for q in VALID_QUARTERS)}인 행 "
+        "(1~4분기가 한 번씩 들어가게 했어요)"
+    )
+
+    try:
+        prep = preprocess_split(df)
+    except ValueError as e:
+        st.error(str(e))
+        return
+
+    summary = prep["summary"]
+
+    # --------------------------------------------------------
+    # 학습용·검증용 행 수와 성장 비율 (표)
+    # --------------------------------------------------------
+
+    st.markdown("### 학습용·검증용 행 수와 성장 비율")
+
+    st.dataframe(
+        summary.round({"성장 비율(%)": 1}),
+        hide_index=True,
+    )
+
+    # --------------------------------------------------------
+    # 막대 그래프 두 개
+    # --------------------------------------------------------
+
+    cols = st.columns(2)
+
+    fig_count = px.bar(
+        summary,
+        x="구분",
+        y="행 수",
+        color="구분",
+        title="행 수",
+    )
+    fig_count.update_traces(
+        texttemplate="%{y:,}",
+        textposition="outside",
+    )
+    fig_count.update_layout(showlegend=False)
+
+    fig_ratio = px.bar(
+        summary,
+        x="구분",
+        y="성장 비율(%)",
+        color="구분",
+        title="성장(1) 비율",
+    )
+    fig_ratio.update_yaxes(range=[0, 100])
+    fig_ratio.update_traces(
+        texttemplate="%{y:.1f}%",
+        textposition="outside",
+    )
+    fig_ratio.update_layout(showlegend=False)
+
+    with cols[0]:
+        st.plotly_chart(fig_count)
+
+    with cols[1]:
+        st.plotly_chart(fig_ratio)
+
+    st.markdown("#### 검증용 분기별 행 수와 성장 비율")
+
+    st.dataframe(
+        prep["valid_by_quarter"].round({"성장 비율(%)": 1}),
+        hide_index=True,
+    )
+
+    st.caption(
+        "검증용의 성장 비율은 분기마다 크게 달라요(계절 효과). "
+        "네 계절이 모두 들어 있어서 한 계절에만 맞춘 모델이 높은 점수를 받기 어려워요."
+    )
+
+    # --------------------------------------------------------
+    # 시간 순서 점검
+    # --------------------------------------------------------
+
+    st.markdown("### 분할 점검")
+
+    scaler = prep["preprocessor"].named_transformers_["num"]
+    checks = prep["checks"]
+
+    check_rows = [
+        (
+            "학습용의 마지막 분기가 검증용의 첫 분기보다 앞선다 (시간 순서)",
+            checks["time_order_ok"],
+        ),
+        (
+            "학습용과 검증용에 겹치는 행이 없다",
+            checks["no_overlap_ok"],
+        ),
+        (
+            "4단계의 모든 행이 학습용 또는 검증용에 들어간다",
+            checks["all_used_ok"],
+        ),
+        (
+            "검증용에 지정한 4개 분기가 모두 들어 있다",
+            checks["valid_quarters_ok"],
+        ),
+        (
+            "전처리기가 학습용 행 수만큼으로만 fit되었다 (검증용 행은 fit에 쓰이지 않음)",
+            int(scaler.n_samples_seen_) == len(prep["X_train"]),
+        ),
+    ]
+
+    st.dataframe(
+        pd.DataFrame(
+            {
+                "점검 내용": [c[0] for c in check_rows],
+                "결과": ["✅ 통과" if c[1] else "❌ 문제" for c in check_rows],
+            }
+        ),
+        hide_index=True,
+    )
+
+    if all(c[1] for c in check_rows):
+        st.success("분할 점검 통과: 시간 순서대로 나뉘었고, 전처리기는 학습용으로만 fit됐어요.")
+    else:
+        st.error("분할 점검에서 문제가 발견됐어요. 위 표의 ❌ 항목을 확인해 주세요.")
+
+    # --------------------------------------------------------
+    # 전처리 결과
+    # --------------------------------------------------------
+
+    st.markdown("### 전처리 결과")
+
+    st.write(
+        "숫자 변수는 **StandardScaler**(평균 0, 표준편차 1로 맞춤), "
+        "업종·자치구·계절 번호는 **OneHotEncoder**(범주마다 0/1 열 만들기)로 바꿔요."
+    )
+
+    cols = st.columns(4)
+
+    big_card(cols[0], "숫자 변수", f"{len(prep['numeric_cols'])}개")
+    big_card(cols[1], "범주 변수", f"{len(prep['categorical_cols'])}개")
+    big_card(cols[2], "변환 후 열 수", f"{prep['X_train_t'].shape[1]:,}")
+    big_card(
+        cols[3],
+        "변환 후 모양 (학습/검증)",
+        f"{prep['X_train_t'].shape[0]:,} / {prep['X_valid_t'].shape[0]:,}",
+    )
+
+    # ----- 스케일링 확인: 학습용은 평균 0·표준편차 1, 검증용은 그렇지 않은 것이 정상 -----
+    st.markdown("#### 숫자 변수 스케일링 확인")
+
+    train_scaled = pd.DataFrame(
+        scaler.transform(prep["X_train"][prep["numeric_cols"]]),
+        columns=prep["numeric_cols"],
+    )
+    valid_scaled = pd.DataFrame(
+        scaler.transform(prep["X_valid"][prep["numeric_cols"]]),
+        columns=prep["numeric_cols"],
+    )
+
+    scale_table = pd.DataFrame(
+        {
+            "변수 이름": prep["numeric_cols"],
+            "학습용 평균": train_scaled.mean().values,
+            "학습용 표준편차": train_scaled.std(ddof=0).values,
+            "검증용 평균": valid_scaled.mean().values,
+            "검증용 표준편차": valid_scaled.std(ddof=0).values,
+        }
+    ).round(3)
+
+    st.dataframe(
+        scale_table,
+        hide_index=True,
+        height=(len(scale_table) + 1) * 35 + 3,
+    )
+
+    st.caption(
+        "학습용은 평균 0, 표준편차 1이 되도록 맞췄어요. "
+        "검증용은 학습용의 평균·표준편차를 그대로 적용했기 때문에 0, 1에서 벗어나는 게 정상이에요. "
+        "(검증용으로 따로 맞췄다면 검증용도 0, 1이 되었을 거예요.)"
+    )
+
+    # ----- 범주 변수: 학습용에 없던 범주 -----
+    st.markdown("#### 범주 변수: 검증용에만 있는 범주")
+
+    cat_rows = []
+
+    for c in prep["categorical_cols"]:
+
+        train_set = set(prep["X_train"][c].unique())
+        valid_set = set(prep["X_valid"][c].unique())
+
+        cat_rows.append(
+            {
+                "변수 이름": c,
+                "학습용 범주 수": len(train_set),
+                "검증용 범주 수": len(valid_set),
+                "학습용에 없던 범주 수": len(valid_set - train_set),
+            }
+        )
+
+    st.dataframe(
+        pd.DataFrame(cat_rows),
+        hide_index=True,
+    )
+
+    st.caption(
+        "학습용에 없던 범주가 검증용에 나오면 OneHotEncoder(handle_unknown=\"ignore\")가 "
+        "오류 대신 모든 열을 0으로 처리해요."
+    )
+
+
+# ============================================================
 # 앱 실행 부분
 # ============================================================
 
@@ -1240,6 +1610,7 @@ PAGES = {
     "2. 데이터 탐색": page_explore,
     "3. 라벨 만들기": page_label,
     "4. 입력 변수": page_features,
+    "5. 데이터 나누기": page_split,
 }
 
 st.sidebar.title(
