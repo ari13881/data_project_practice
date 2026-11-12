@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import glob
 
@@ -776,6 +777,380 @@ def page_label(df):
 
 
 # ============================================================
+# 4. 입력 변수 만들기
+# ============================================================
+
+def safe_ratio(num, den):
+    """num ÷ den. 분모가 0이면 0으로 처리한다."""
+
+    return (num / den.where(den != 0)).fillna(0.0)
+
+
+def safe_log1p(value):
+    """math.log1p. 0 이하의 값은 로그를 구할 수 없으므로 0으로 처리한다."""
+
+    return math.log1p(value) if value > 0 else 0.0
+
+
+@st.cache_data
+def make_feature_data(df):
+    """
+    성장여부를 예측할 입력 변수를 만든다.
+
+    [데이터 누수 방지 규칙]
+    입력 변수는 모두 '직전 분기'(예측 대상 분기보다 1분기 앞) 또는
+    '전전 분기'(2분기 앞) 행에서만 가져온다.
+    예측 대상 분기(당월)의 금액·건수는 입력에 절대 넣지 않는다.
+
+    돌려주는 값: 딕셔너리 (data, feature_cols, info, stats)
+    """
+
+    # 3단계에서 만든 라벨 데이터 (예측 대상 분기 한 줄이 한 행)
+    labeled, label_stats = make_label_data(df)
+
+    keys = ["자치구_코드", "서비스_업종_코드"]
+
+    # 3단계와 똑같은 방식으로 분기 번호를 만들고 겹치는 행을 제거
+    work = df.copy()
+    work["분기번호"] = (
+        (work["기준_년분기_코드"] // 10) * 4
+        + (work["기준_년분기_코드"] % 10)
+    )
+    work = work.drop_duplicates(
+        subset=keys + ["분기번호"],
+        keep="first"
+    )
+
+    # 입력 변수를 만드는 데 필요한 열 찾기
+    age_cols = [
+        c for c in df.columns
+        if c.startswith("연령대_") and c.endswith("_매출_금액")
+    ]
+    time_cols = [
+        c for c in df.columns
+        if c.startswith("시간대_") and c.endswith("_매출_금액")
+    ]
+    need_cols = (
+        [
+            "당월_매출_금액", "당월_매출_건수",
+            "주중_매출_금액", "주말_매출_금액",
+            "남성_매출_금액", "여성_매출_금액",
+        ]
+        + age_cols
+        + time_cols
+    )
+
+    missing = [c for c in need_cols if c not in df.columns]
+
+    if missing or len(age_cols) != 6 or len(time_cols) != 6:
+        raise ValueError(
+            "입력 변수를 만드는 데 필요한 열을 찾지 못했어요. "
+            f"없는 열: {missing}, 연령대 열 {len(age_cols)}개, 시간대 열 {len(time_cols)}개"
+        )
+
+    # 예측 대상 행의 기본 정보 (여기에는 당월 금액을 가져오지 않는다)
+    # 직전분기_매출_금액은 3단계에서 구한 값이고, 아래 점검용으로만 쓴다
+    base = labeled[
+        ["기준_년분기_코드", "분기번호"] + keys
+        + ["자치구_코드_명", "서비스_업종_코드_명", "직전분기_매출_금액", "성장여부"]
+    ].copy()
+
+    # ----- 직전 분기 행 붙이기 (분기번호가 정확히 1 작은 행) -----
+    p1 = work[keys + ["분기번호"] + need_cols].copy()
+    p1["직전분기번호"] = p1["분기번호"]          # 원래 분기 번호를 점검용으로 보관
+    p1["분기번호"] = p1["분기번호"] + 1          # 다음 분기 행과 짝이 맞도록 옮김
+    p1 = p1.rename(columns={c: f"p1_{c}" for c in need_cols})
+
+    merged = base.merge(p1, on=keys + ["분기번호"], how="left")
+
+    # ----- 전전 분기 행 붙이기 (분기번호가 정확히 2 작은 행, 매출만 필요) -----
+    p2 = work[keys + ["분기번호", "당월_매출_금액"]].copy()
+    p2["전전분기번호"] = p2["분기번호"]
+    p2["분기번호"] = p2["분기번호"] + 2
+    p2 = p2.rename(columns={"당월_매출_금액": "p2_당월_매출_금액"})
+
+    merged = merged.merge(p2, on=keys + ["분기번호"], how="left")
+
+    # 전전 분기가 없는 행은 제외 (직전 분기 증감률을 구할 수 없음)
+    has_p2 = merged["p2_당월_매출_금액"].notna()
+    excluded_no_p2 = int((~has_p2).sum())
+    data = merged[has_p2].reset_index(drop=True)
+
+    # ----- 입력 변수 만들기 -----
+    feat = pd.DataFrame(index=data.index)
+    info = []
+
+    def add(name, series, description):
+        feat[name] = series
+        info.append({"변수 이름": name, "설명": description})
+
+    add(
+        "직전_매출_로그",
+        data["p1_당월_매출_금액"].map(safe_log1p),
+        "직전 분기 매출 금액의 로그값 (math.log1p, 0 이하는 0)",
+    )
+    add(
+        "직전_객단가",
+        safe_ratio(data["p1_당월_매출_금액"], data["p1_당월_매출_건수"]),
+        "직전 분기 매출 금액 ÷ 직전 분기 매출 건수 (거래 1건당 매출)",
+    )
+    add(
+        "직전_주말_매출_비중",
+        safe_ratio(
+            data["p1_주말_매출_금액"],
+            data["p1_주중_매출_금액"] + data["p1_주말_매출_금액"],
+        ),
+        "직전 분기 주말 매출 ÷ (주중 + 주말 매출)",
+    )
+    add(
+        "직전_여성_매출_비중",
+        safe_ratio(
+            data["p1_여성_매출_금액"],
+            data["p1_남성_매출_금액"] + data["p1_여성_매출_금액"],
+        ),
+        "직전 분기 여성 매출 ÷ (남성 + 여성 매출)",
+    )
+
+    age_total = data[[f"p1_{c}" for c in age_cols]].sum(axis=1)
+
+    for c in age_cols:
+        group = c.replace("연령대_", "").replace("_매출_금액", "")
+        add(
+            f"직전_연령대_{group}_매출_비중",
+            safe_ratio(data[f"p1_{c}"], age_total),
+            f"직전 분기 연령대 {group} 매출 ÷ 연령대 6개 매출 합계",
+        )
+
+    time_total = data[[f"p1_{c}" for c in time_cols]].sum(axis=1)
+
+    for c in time_cols:
+        group = c.replace("시간대_", "").replace("_매출_금액", "")
+        add(
+            f"직전_시간대_{group}_매출_비중",
+            safe_ratio(data[f"p1_{c}"], time_total),
+            f"직전 분기 시간대 {group}시 매출 ÷ 시간대 6개 매출 합계",
+        )
+
+    add(
+        "직전_증감률",
+        (
+            data["p1_당월_매출_금액"]
+            / data["p2_당월_매출_금액"].where(data["p2_당월_매출_금액"] != 0)
+            - 1
+        ).fillna(0.0),
+        "직전 분기 매출 ÷ 전전 분기 매출 − 1 (전전 분기 매출이 0이면 0)",
+    )
+    add(
+        "계절_번호",
+        data["기준_년분기_코드"] % 10,
+        "예측 대상 분기의 분기 번호(1~4). 미리 알 수 있는 값이라 누수가 아님",
+    )
+    add(
+        "서비스_업종_코드_명",
+        data["서비스_업종_코드_명"],
+        "업종 이름 (글자 그대로, 인코딩은 다음 단계에서)",
+    )
+    add(
+        "자치구_코드_명",
+        data["자치구_코드_명"],
+        "자치구 이름 (글자 그대로, 인코딩은 다음 단계에서)",
+    )
+
+    feature_cols = list(feat.columns)
+
+    out = pd.concat(
+        [
+            data[["기준_년분기_코드", "분기번호", "자치구_코드", "서비스_업종_코드", "성장여부"]],
+            feat,
+        ],
+        axis=1,
+    )
+
+    stats = {
+        "label_rows": len(merged),
+        "excluded_no_p2": excluded_no_p2,
+        "final_rows": len(out),
+        # 점검용: 입력 정보를 가져온 행이 정말 1분기 앞, 2분기 앞인지
+        "prev_gap_ok": bool(((data["분기번호"] - data["직전분기번호"]) == 1).all()),
+        "prev2_gap_ok": bool(((data["분기번호"] - data["전전분기번호"]) == 2).all()),
+        # 점검용: 3단계의 직전 분기 매출과 4단계가 쓴 직전 분기 매출이 같은지
+        "prev_match_ok": bool(
+            (data["직전분기_매출_금액"] == data["p1_당월_매출_금액"]).all()
+        ),
+    }
+
+    return {
+        "data": out,
+        "feature_cols": feature_cols,
+        "info": pd.DataFrame(info),
+        "stats": stats,
+    }
+
+
+def page_features(df):
+
+    st.subheader("4. 입력 변수")
+
+    st.write(
+        "성장여부를 맞히는 데 쓸 **입력 변수(힌트)** 를 만들어요."
+    )
+
+    st.info(
+        "가장 중요한 규칙: 입력 변수는 모두 **직전 분기 또는 그 이전 정보**로만 만들어요. "
+        "예측 대상 분기(당월)의 금액·건수가 입력에 들어가면 정답을 미리 알려 주는 "
+        "**데이터 누수**가 생겨서 평가 점수가 가짜로 높아져요."
+    )
+
+    try:
+        result = make_feature_data(df)
+    except ValueError as e:
+        st.error(str(e))
+        return
+
+    out = result["data"]
+    feature_cols = result["feature_cols"]
+    info = result["info"]
+    stats = result["stats"]
+
+    # --------------------------------------------------------
+    # 입력 변수 목록 표
+    # --------------------------------------------------------
+
+    st.markdown(f"### 입력 변수 목록 ({len(feature_cols)}개)")
+
+    st.dataframe(
+        info,
+        hide_index=True,
+        height=(len(info) + 1) * 35 + 3,
+    )
+
+    # --------------------------------------------------------
+    # 행 수
+    # --------------------------------------------------------
+
+    st.markdown("### 전전 분기가 없어서 제외한 행")
+
+    cols = st.columns(3)
+
+    big_card(cols[0], "3단계에서 남은 행", f"{stats['label_rows']:,}")
+    big_card(cols[1], "제외한 행 수", f"{stats['excluded_no_p2']:,}")
+    big_card(cols[2], "최종 행 수", f"{stats['final_rows']:,}")
+
+    st.caption(
+        "직전 분기 증감률(직전 ÷ 전전 − 1)을 구하려면 전전 분기 매출이 있어야 해서, "
+        "전전 분기 행이 없는 행을 제외했어요."
+    )
+
+    # --------------------------------------------------------
+    # 만든 데이터 처음 다섯 줄
+    # --------------------------------------------------------
+
+    st.markdown("### 만든 데이터 처음 다섯 줄")
+
+    st.caption("예측 대상 분기, 정답(성장여부), 입력 변수를 보여 줘요.")
+
+    st.dataframe(
+        out[["기준_년분기_코드", "성장여부"] + feature_cols].head(5),
+        hide_index=True,
+    )
+
+    # --------------------------------------------------------
+    # 성장여부(0/1)별 입력 변수 평균 비교
+    # --------------------------------------------------------
+
+    st.markdown("### 성장여부(0/1)별 입력 변수 평균 비교")
+
+    numeric_features = [
+        c for c in feature_cols
+        if pd.api.types.is_numeric_dtype(out[c])
+    ]
+
+    mean_table = out.groupby("성장여부")[numeric_features].mean().T
+    mean_table.columns = ["하락·같음(0) 평균", "성장(1) 평균"]
+    mean_table["차이(성장 − 하락)"] = (
+        mean_table["성장(1) 평균"] - mean_table["하락·같음(0) 평균"]
+    )
+    mean_table = mean_table.round(4).reset_index(names="변수 이름")
+
+    st.dataframe(
+        mean_table,
+        hide_index=True,
+        height=(len(mean_table) + 1) * 35 + 3,
+    )
+
+    st.caption(
+        "변수마다 단위가 달라서 '차이'의 크기를 변수끼리 바로 비교할 수는 없어요. "
+        "두 그룹의 평균이 눈에 띄게 다른 변수가 구분에 도움이 될 수 있다는 힌트로만 봐 주세요."
+    )
+
+    # --------------------------------------------------------
+    # 누수 점검
+    # --------------------------------------------------------
+
+    st.markdown("### 누수 점검")
+
+    # 원본 데이터의 금액·건수 열은 모두 '그 행의 분기(= 예측 대상 분기)' 값이다
+    current_cols = [
+        c for c in df.columns
+        if c.endswith("_금액") or c.endswith("_건수")
+    ]
+
+    same_name = [c for c in feature_cols if c in current_cols]
+    has_current_word = [c for c in feature_cols if "당월" in c]
+    label_in_features = [c for c in feature_cols if c == "성장여부"]
+
+    checks = [
+        (
+            "입력 변수 중 원본의 금액·건수 열(당월 값)과 이름이 같은 변수가 없다",
+            len(same_name) == 0,
+            f"{len(same_name)}개",
+        ),
+        (
+            "입력 변수 이름에 '당월'이 들어간 것이 없다",
+            len(has_current_word) == 0,
+            f"{len(has_current_word)}개",
+        ),
+        (
+            "정답(성장여부)이 입력 변수에 들어 있지 않다",
+            len(label_in_features) == 0,
+            f"{len(label_in_features)}개",
+        ),
+        (
+            "입력 정보를 가져온 행이 예측 대상 분기보다 정확히 1분기(직전)·2분기(전전) 앞이다",
+            stats["prev_gap_ok"] and stats["prev2_gap_ok"],
+            "모든 행 확인",
+        ),
+        (
+            "3단계에서 구한 직전 분기 매출과 4단계가 쓴 직전 분기 매출이 모든 행에서 같다",
+            stats["prev_match_ok"],
+            "모든 행 확인",
+        ),
+    ]
+
+    check_table = pd.DataFrame(
+        {
+            "점검 내용": [c[0] for c in checks],
+            "결과": ["✅ 통과" if c[1] else "❌ 문제" for c in checks],
+            "상세": [c[2] for c in checks],
+        }
+    )
+
+    st.dataframe(check_table, hide_index=True)
+
+    if all(c[1] for c in checks):
+
+        st.success(
+            "누수 점검 통과: 입력 변수 목록에 예측 대상 분기(당월)의 값이 하나도 없어요."
+        )
+
+    else:
+
+        st.error(
+            "누수 점검에서 문제가 발견됐어요. 위 표의 ❌ 항목을 확인해 주세요."
+        )
+
+
+# ============================================================
 # 앱 실행 부분
 # ============================================================
 
@@ -864,6 +1239,7 @@ PAGES = {
     "1. 데이터 소개": page_intro,
     "2. 데이터 탐색": page_explore,
     "3. 라벨 만들기": page_label,
+    "4. 입력 변수": page_features,
 }
 
 st.sidebar.title(
