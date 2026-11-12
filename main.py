@@ -2,11 +2,16 @@ import json
 import math
 import os
 import glob
+import time
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
@@ -44,6 +49,11 @@ VALID_QUARTERS = [20253, 20254, 20261, 20262]   # 검증용: 네 계절이 한 �
 
 # 숫자가 아니라 '범주'로 다룰 입력 변수 (나머지는 숫자 변수)
 CATEGORY_FEATURES = ["서비스_업종_코드_명", "자치구_코드_명", "계절_번호"]
+
+# 모델 학습 설정
+RANDOM_STATE = 42
+MODEL_NAMES = ["기준선(Dummy)", "로지스틱 회귀", "랜덤포레스트"]
+BALANCED_RANGE = (0.3, 0.7)   # 학습용 성장 비율이 이 범위 안이면 '치우치지 않았다'고 보고 class_weight를 쓰지 않음
 
 
 # ============================================================
@@ -1521,6 +1531,215 @@ def page_split(df):
 
 
 # ============================================================
+# 6. 모델 학습
+# ============================================================
+
+def build_models(numeric_cols, categorical_cols, class_weight=None):
+    """
+    5단계 전처리와 모델을 Pipeline으로 연결한 모델 세 개를 만든다. (아직 학습 전)
+
+    Pipeline을 fit하면 전처리기도 '학습용 데이터로만' fit되고,
+    검증용을 예측할 때는 transform만 적용되므로 데이터 누수가 생기지 않는다.
+    """
+
+    def make_pipeline(model):
+        return Pipeline(
+            steps=[
+                ("preprocess", build_preprocessor(numeric_cols, categorical_cols)),
+                ("model", model),
+            ]
+        )
+
+    return {
+        "기준선(Dummy)": make_pipeline(
+            DummyClassifier(
+                strategy="most_frequent",
+                random_state=RANDOM_STATE,
+            )
+        ),
+        "로지스틱 회귀": make_pipeline(
+            LogisticRegression(
+                max_iter=1000,
+                random_state=RANDOM_STATE,
+                class_weight=class_weight,
+            )
+        ),
+        "랜덤포레스트": make_pipeline(
+            RandomForestClassifier(
+                n_estimators=200,
+                min_samples_leaf=5,
+                random_state=RANDOM_STATE,
+                class_weight=class_weight,
+            )
+        ),
+    }
+
+
+def train_all_models(split, class_weight=None):
+    """
+    모델 세 개를 학습용 데이터로 학습시키고,
+    검증용 예측값(클래스와 성장 확률)과 학습 시간을 돌려준다.
+    """
+
+    models = build_models(
+        split["numeric_cols"],
+        split["categorical_cols"],
+        class_weight,
+    )
+
+    # 검증용 예측값을 모아 둘 표: 예측 대상 분기, 정답, 모델별 예측 클래스와 성장 확률
+    predictions = pd.DataFrame(
+        {
+            "기준_년분기_코드": split["q_valid"].values,
+            "정답": split["y_valid"].values,
+        }
+    )
+
+    time_rows = []
+
+    for name, model in models.items():
+
+        # 학습 (학습용 데이터만 사용) + 걸린 시간 재기
+        start = time.perf_counter()
+        model.fit(split["X_train"], split["y_train"])
+        elapsed = time.perf_counter() - start
+
+        # 검증용 예측 (전처리는 transform만 적용됨)
+        predictions[f"{name}_예측"] = model.predict(split["X_valid"])
+
+        # 성장(1) 확률: predict_proba에서 클래스 1에 해당하는 열
+        class_index = list(model.classes_).index(1)
+        predictions[f"{name}_성장확률"] = model.predict_proba(
+            split["X_valid"]
+        )[:, class_index]
+
+        time_rows.append(
+            {
+                "모델": name,
+                "학습 완료": "✅ 학습 완료",
+                "학습 시간(초)": round(elapsed, 2),
+            }
+        )
+
+    return models, predictions, pd.DataFrame(time_rows)
+
+
+def page_train(df):
+
+    st.subheader("6. 모델 학습")
+
+    st.write(
+        "5단계 전처리와 모델을 **Pipeline**으로 이어서 모델 세 개를 학습시켜요. "
+        "세 모델은 모두 학습용 데이터로만 학습하고, `random_state`는 42로 고정했어요."
+    )
+
+    st.markdown(
+        "- **기준선(Dummy)**: 항상 학습용에서 더 많았던 쪽으로 찍는 모델이에요. 다른 모델이 이보다 나아야 의미가 있어요.\n"
+        "- **로지스틱 회귀**: 입력 변수의 가중합으로 성장 확률을 계산하는 기본 분류 모델이에요.\n"
+        "- **랜덤포레스트**: 결정트리 200개의 의견을 모아 정하는 모델이에요."
+    )
+
+    try:
+        split = split_train_valid(df)
+    except ValueError as e:
+        st.error(str(e))
+        return
+
+    # ----- 성장 비율이 치우쳤는지 확인해서 class_weight 사용 여부 결정 -----
+    train_ratio = float(split["y_train"].mean())
+    balanced = BALANCED_RANGE[0] <= train_ratio <= BALANCED_RANGE[1]
+    class_weight = None if balanced else "balanced"
+
+    if balanced:
+
+        st.info(
+            f"학습용 성장 비율이 {train_ratio * 100:.1f}%로 치우치지 않아서 "
+            "class_weight는 쓰지 않아요."
+        )
+
+    else:
+
+        st.warning(
+            f"학습용 성장 비율이 {train_ratio * 100:.1f}%로 한쪽에 치우쳐 있어서 "
+            "로지스틱 회귀와 랜덤포레스트에 class_weight='balanced'를 적용해요."
+        )
+
+    cols = st.columns(3)
+
+    big_card(cols[0], "학습용 행 수", f"{len(split['X_train']):,}")
+    big_card(cols[1], "검증용 행 수", f"{len(split['X_valid']):,}")
+    big_card(cols[2], "입력 변수", f"{len(split['numeric_cols']) + len(split['categorical_cols'])}개")
+
+    # ----- 학습 버튼: 눌렀을 때만 학습한다 -----
+    st.markdown("### 학습하기")
+
+    if st.button("모델 학습하기", key="train_models"):
+
+        try:
+
+            with st.spinner("모델을 학습하는 중이에요. 랜덤포레스트는 조금 걸릴 수 있어요..."):
+
+                models, predictions, train_times = train_all_models(
+                    split,
+                    class_weight,
+                )
+
+            # 다음 단계(모델 평가)에서 쓸 수 있도록 session_state에 저장
+            st.session_state["trained_models"] = models           # 학습된 Pipeline 3개 (딕셔너리)
+            st.session_state["valid_predictions"] = predictions   # 검증용 예측 클래스·성장 확률 표
+            st.session_state["train_results"] = train_times       # 학습 완료 여부와 학습 시간 표
+
+            st.success("모델 3개의 학습이 끝났어요.")
+
+        except Exception as e:
+
+            st.error(f"학습 중 오류가 발생했어요: {e}")
+
+    # ----- 학습 완료 여부와 학습 시간 표 -----
+    st.markdown("### 학습 완료 여부와 학습 시간")
+
+    if "train_results" in st.session_state:
+
+        results = st.session_state["train_results"]
+
+    else:
+
+        results = pd.DataFrame(
+            {
+                "모델": MODEL_NAMES,
+                "학습 완료": "⏳ 아직 학습 전",
+                "학습 시간(초)": None,
+            }
+        )
+
+    st.dataframe(
+        results,
+        hide_index=True,
+    )
+
+    # ----- 저장된 검증용 예측값 미리보기 -----
+    if "valid_predictions" in st.session_state:
+
+        predictions = st.session_state["valid_predictions"]
+
+        st.markdown("### 저장된 검증용 예측값 (처음 다섯 줄)")
+
+        st.caption(
+            f"검증용 {len(predictions):,}행에 대해 모델별 예측 클래스(0/1)와 성장(1) 확률을 저장했어요. "
+            "다음 단계에서 이 값으로 성능을 평가해요."
+        )
+
+        st.dataframe(
+            predictions.head(5),
+            hide_index=True,
+        )
+
+    else:
+
+        st.caption("아직 학습하지 않았어요. 위의 '모델 학습하기' 버튼을 눌러 주세요.")
+
+
+# ============================================================
 # 앱 실행 부분
 # ============================================================
 
@@ -1611,6 +1830,7 @@ PAGES = {
     "3. 라벨 만들기": page_label,
     "4. 입력 변수": page_features,
     "5. 데이터 나누기": page_split,
+    "6. 모델 학습": page_train,
 }
 
 st.sidebar.title(
