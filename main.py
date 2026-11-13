@@ -11,6 +11,15 @@ from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -1740,6 +1749,302 @@ def page_train(df):
 
 
 # ============================================================
+# 7. 모델 평가
+# ============================================================
+
+BASELINE_NAME = "기준선(Dummy)"
+
+
+def evaluate_models(predictions):
+    """
+    6단계에서 저장한 검증용 예측값으로 모델별 평가 지표와 ROC 곡선 데이터를 만든다.
+
+    돌려주는 값: (지표 표, ROC 곡선용 표, 모델 이름 목록)
+    """
+
+    y_true = predictions["정답"]
+
+    model_names = [
+        n for n in MODEL_NAMES
+        if f"{n}_예측" in predictions.columns
+    ]
+
+    metric_rows = []
+    roc_tables = []
+
+    for name in model_names:
+
+        y_pred = predictions[f"{name}_예측"]
+        y_prob = predictions[f"{name}_성장확률"]
+
+        auc = roc_auc_score(y_true, y_prob)
+
+        # zero_division=0: 성장(1)을 한 번도 예측하지 않는 모델(Dummy)은 정밀도 등을 0으로 처리
+        metric_rows.append(
+            {
+                "모델": name,
+                "정확도": accuracy_score(y_true, y_pred),
+                "정밀도": precision_score(y_true, y_pred, zero_division=0),
+                "재현율": recall_score(y_true, y_pred, zero_division=0),
+                "F1": f1_score(y_true, y_pred, zero_division=0),
+                "ROC-AUC": auc,
+            }
+        )
+
+        fpr, tpr, _ = roc_curve(y_true, y_prob)
+
+        roc_tables.append(
+            pd.DataFrame(
+                {
+                    "모델": f"{name} (AUC {auc:.3f})",
+                    "거짓 양성 비율(FPR)": fpr,
+                    "참 양성 비율(TPR)": tpr,
+                }
+            )
+        )
+
+    return (
+        pd.DataFrame(metric_rows),
+        pd.concat(roc_tables, ignore_index=True),
+        model_names,
+    )
+
+
+def accuracy_by_quarter(predictions, model_names):
+    """검증용 분기별로 모델마다 정확도를 계산한다."""
+
+    rows = []
+
+    for code, part in predictions.groupby("기준_년분기_코드"):
+
+        for name in model_names:
+
+            rows.append(
+                {
+                    "분기코드": code,
+                    "분기": quarter_label(code),
+                    "모델": name,
+                    "정확도": accuracy_score(part["정답"], part[f"{name}_예측"]),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def summarize_vs_baseline(metrics):
+    """기준선(Dummy)보다 F1과 ROC-AUC가 높은 모델이 무엇인지 문장으로 요약한다."""
+
+    base = metrics[metrics["모델"] == BASELINE_NAME].iloc[0]
+    others = metrics[metrics["모델"] != BASELINE_NAME]
+
+    lines = []
+    beat_both = []
+
+    for _, r in others.iterrows():
+
+        f1_up = r["F1"] > base["F1"]
+        auc_up = r["ROC-AUC"] > base["ROC-AUC"]
+
+        detail = (
+            f"F1 {r['F1']:.3f} (기준선 {base['F1']:.3f}), "
+            f"ROC-AUC {r['ROC-AUC']:.3f} (기준선 {base['ROC-AUC']:.3f})"
+        )
+
+        if f1_up and auc_up:
+            lines.append(f"**{r['모델']}**: F1과 ROC-AUC가 모두 기준선보다 높아요. → {detail}")
+            beat_both.append(r["모델"])
+        elif f1_up:
+            lines.append(f"**{r['모델']}**: F1만 기준선보다 높아요. → {detail}")
+        elif auc_up:
+            lines.append(f"**{r['모델']}**: ROC-AUC만 기준선보다 높아요. → {detail}")
+        else:
+            lines.append(f"**{r['모델']}**: F1과 ROC-AUC 모두 기준선보다 높지 않아요. → {detail}")
+
+    best_f1 = metrics.loc[metrics["F1"].idxmax(), "모델"]
+    best_auc = metrics.loc[metrics["ROC-AUC"].idxmax(), "모델"]
+
+    conclusion = (
+        f"F1이 가장 높은 모델은 **{best_f1}**, "
+        f"ROC-AUC가 가장 높은 모델은 **{best_auc}**예요."
+    )
+
+    return lines, conclusion, beat_both
+
+
+def page_eval(df):
+
+    st.subheader("7. 모델 평가")
+
+    # 6단계에서 학습한 결과가 없으면 안내만 보여 주고 끝낸다
+    if "valid_predictions" not in st.session_state:
+
+        st.warning(
+            "아직 학습된 모델이 없어요. 먼저 왼쪽 메뉴에서 '6. 모델 학습'으로 가서 "
+            "'모델 학습하기' 버튼을 눌러 주세요."
+        )
+
+        return
+
+    predictions = st.session_state["valid_predictions"]
+
+    metrics, roc_table, model_names = evaluate_models(predictions)
+
+    st.write(
+        f"검증용 {len(predictions):,}행(학습에 쓰지 않은 최근 4개 분기)에 대한 "
+        "세 모델의 예측값으로 성능을 평가해요."
+    )
+
+    # --------------------------------------------------------
+    # 1) 모델별 평가 지표 비교표
+    # --------------------------------------------------------
+
+    st.markdown("### 1) 모델별 평가 지표 비교")
+
+    st.dataframe(
+        metrics.round(3),
+        hide_index=True,
+    )
+
+    st.caption(
+        "정확도: 전체 중 맞힌 비율 / 정밀도: 성장이라고 예측한 것 중 실제 성장 비율 / "
+        "재현율: 실제 성장 중 찾아낸 비율 / F1: 정밀도와 재현율의 조화평균 / "
+        "ROC-AUC: 확률로 성장과 하락을 얼마나 잘 가르는지 (0.5는 찍는 수준, 1에 가까울수록 좋음). "
+        "기준선은 성장(1)을 한 번도 예측하지 않아서 정밀도·재현율·F1이 0이에요."
+    )
+
+    # --------------------------------------------------------
+    # 2) 기준선과의 비교 요약 (자동 문장)
+    # --------------------------------------------------------
+
+    st.markdown("### 2) 기준선(Dummy)과 비교한 요약")
+
+    if BASELINE_NAME not in model_names:
+
+        st.info("기준선 모델의 예측값이 없어서 비교 요약을 만들 수 없어요.")
+
+    else:
+
+        lines, conclusion, beat_both = summarize_vs_baseline(metrics)
+
+        for line in lines:
+            st.markdown(f"- {line}")
+
+        if beat_both:
+            st.success(
+                f"{', '.join(beat_both)}: 기준선보다 F1과 ROC-AUC가 모두 높아요. " + conclusion
+            )
+        else:
+            st.warning("F1과 ROC-AUC가 모두 기준선보다 높은 모델이 없어요. " + conclusion)
+
+    # --------------------------------------------------------
+    # 3) 혼동행렬 (모델 선택)
+    # --------------------------------------------------------
+
+    st.markdown("### 3) 혼동행렬")
+
+    selected = st.selectbox(
+        "혼동행렬을 볼 모델",
+        model_names,
+        key="eval_model",
+    )
+
+    cm = confusion_matrix(
+        predictions["정답"],
+        predictions[f"{selected}_예측"],
+        labels=[0, 1],
+    )
+
+    fig_cm = px.imshow(
+        cm,
+        text_auto=True,
+        x=["예측 0 (하락·같음)", "예측 1 (성장)"],
+        y=["실제 0 (하락·같음)", "실제 1 (성장)"],
+        color_continuous_scale="Blues",
+        title=f"{selected} 혼동행렬",
+    )
+    fig_cm.update_layout(coloraxis_showscale=False)
+    fig_cm.update_xaxes(title_text="모델의 예측", side="bottom")
+    fig_cm.update_yaxes(title_text="실제 값")
+
+    st.plotly_chart(fig_cm)
+
+    tn, fp, fn, tp = (int(v) for v in cm.ravel())
+
+    st.caption(
+        f"하락·같음을 맞힌 수 {tn:,} / 하락인데 성장으로 잘못 예측한 수 {fp:,} / "
+        f"성장인데 하락으로 잘못 예측한 수 {fn:,} / 성장을 맞힌 수 {tp:,}"
+    )
+
+    # --------------------------------------------------------
+    # 4) ROC 곡선
+    # --------------------------------------------------------
+
+    st.markdown("### 4) ROC 곡선")
+
+    fig_roc = px.line(
+        roc_table,
+        x="거짓 양성 비율(FPR)",
+        y="참 양성 비율(TPR)",
+        color="모델",
+    )
+    # 대각선 기준선 (찍는 수준, AUC 0.5)
+    fig_roc.add_shape(
+        type="line",
+        x0=0, y0=0, x1=1, y1=1,
+        line=dict(dash="dash", color="gray"),
+    )
+    fig_roc.update_xaxes(range=[0, 1])
+    fig_roc.update_yaxes(range=[0, 1])
+
+    st.plotly_chart(fig_roc)
+
+    st.caption("점선 대각선은 아무렇게나 찍는 수준(AUC 0.5)이에요. 곡선이 왼쪽 위로 휘어질수록 좋아요.")
+
+    # --------------------------------------------------------
+    # 5) 검증용 분기별 정확도 (계절별 안정성)
+    # --------------------------------------------------------
+
+    st.markdown("### 5) 검증용 분기별 정확도")
+
+    by_quarter = accuracy_by_quarter(predictions, model_names)
+
+    quarter_order = [
+        quarter_label(c) for c in sorted(by_quarter["분기코드"].unique())
+    ]
+
+    fig_q = px.bar(
+        by_quarter,
+        x="분기",
+        y="정확도",
+        color="모델",
+        barmode="group",
+        category_orders={"분기": quarter_order, "모델": model_names},
+    )
+    fig_q.update_yaxes(range=[0, 1])
+    fig_q.update_traces(
+        texttemplate="%{y:.2f}",
+        textposition="outside",
+    )
+
+    st.plotly_chart(fig_q)
+
+    # 분기별 정확도 표와 '최고 − 최저' 차이 (작을수록 계절에 덜 흔들림)
+    pivot = by_quarter.pivot(index="모델", columns="분기", values="정확도")
+    pivot = pivot[quarter_order].loc[model_names]
+    pivot["최고 − 최저"] = pivot.max(axis=1) - pivot.min(axis=1)
+
+    st.dataframe(
+        pivot.round(3).reset_index(),
+        hide_index=True,
+    )
+
+    st.caption(
+        "'최고 − 최저'가 작을수록 분기(계절)가 바뀌어도 성능이 비슷하다는 뜻이에요. "
+        "검증용 분기마다 성장 비율이 다르다는 점도 함께 봐 주세요."
+    )
+
+
+# ============================================================
 # 앱 실행 부분
 # ============================================================
 
@@ -1831,6 +2136,7 @@ PAGES = {
     "4. 입력 변수": page_features,
     "5. 데이터 나누기": page_split,
     "6. 모델 학습": page_train,
+    "7. 모델 평가": page_eval,
 }
 
 st.sidebar.title(
