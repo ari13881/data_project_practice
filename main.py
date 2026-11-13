@@ -51,6 +51,7 @@ RECORD_DIR = os.path.join(BASE_DIR, "내_기록")
 INTRO_JSON = os.path.join(RECORD_DIR, "데이터소개.json")
 EXPLORE_JSON = os.path.join(RECORD_DIR, "데이터탐색.json")
 LABEL_JSON = os.path.join(RECORD_DIR, "라벨만들기.json")
+INTERPRET_JSON = os.path.join(RECORD_DIR, "결과해석.json")
 
 # 시간 순서 분할 기준 (예측 대상 분기 코드)
 TRAIN_LAST_QUARTER = 20252                      # 학습용: 이 분기 이하
@@ -63,6 +64,21 @@ CATEGORY_FEATURES = ["서비스_업종_코드_명", "자치구_코드_명", "계
 RANDOM_STATE = 42
 MODEL_NAMES = ["기준선(Dummy)", "로지스틱 회귀", "랜덤포레스트"]
 BALANCED_RANGE = (0.3, 0.7)   # 학습용 성장 비율이 이 범위 안이면 '치우치지 않았다'고 보고 class_weight를 쓰지 않음
+
+# 8단계 '경영적 시사점과 한계' 글상자에 처음부터 들어가 있는 글 (이번 분석 결과를 바탕으로 작성)
+DEFAULT_INTERPRET_NOTE = """[경영적 시사점]
+1. 직전 분기에 매출이 급등한 업종은 다음 분기에 꺾이기 쉽고, 크게 줄었던 업종은 반등하기 쉬운 경향이 있었다. 직전 증감률은 로지스틱 회귀 계수(−1.79)와 랜덤포레스트 중요도(17.9%) 모두에서 1위였다. 따라서 한 분기의 급등만 보고 확장이나 투자를 결정하기보다 몇 분기에 걸친 추세를 함께 보는 것이 안전하다.
+2. 계절의 영향이 크다. 1분기는 성장 확률을 낮추고(계수 −0.72) 2분기는 높인다(+0.69). 분기 매출이 줄었다고 곧바로 사업이 나빠졌다고 보기보다 전년 같은 분기와 비교하는 것이 합리적이다.
+3. 업종마다 흐름이 다르다. 의약품, 한식음식점, 일반의원 등은 성장 쪽으로, 애완동물, 고시원, 네일숍 등은 하락 쪽으로 작용했다. 업종을 고를 때는 그 업종 자체의 흐름도 함께 고려해야 한다.
+4. 자치구의 중요도는 원래 변수 단위로 가장 낮았다(1.8%). 이 분석에서는 '어느 자치구에 있는가'보다 '어떤 업종이고 최근 흐름이 어떠한가'가 성장 여부와 더 관련이 있었다.
+
+[한계]
+- 가장 좋은 모델(랜덤포레스트)도 정확도 약 71%, ROC-AUC 0.79로, 참고 자료로 쓸 수준이지 확정적인 예측은 아니다. 실제로 성장한 업종을 놓친 경우가 잘못 성장으로 예측한 경우보다 많았다.
+- 평가가 최근 4개 분기 한 번의 결과여서 다른 기간에서도 같은 성능이 나오는지는 확인하지 못했다.
+- 외국어학원, 치과의원, 미곡판매 등은 오분류율이 40%대로 찍는 수준에 가까웠다. 업종당 검증 행이 약 100개라 우연 오차(약 5%p)가 있어서 순위 차이는 신중하게 봐야 한다.
+- 계수와 변수 중요도는 모델이 근거로 삼은 변수일 뿐 원인을 뜻하지 않는다. 연령대와 시간대 비중은 합이 1인 구성비여서 하나씩 떼어 해석하기 어렵다.
+- 직전 증감률에는 극단값이 있었고, 라벨은 늘었는지 여부만 구분해서 증가 폭은 반영하지 못한다. 금액에 물가가 반영되지 않았다면 물가 상승이 성장으로 보일 수 있다.
+- 자치구·업종 단위로 모아 놓은 데이터라 개별 점포의 성과나 경기·정책 같은 외부 요인은 설명하지 못한다."""
 
 
 # ============================================================
@@ -2045,6 +2061,410 @@ def page_eval(df):
 
 
 # ============================================================
+# 8. 결과 해석
+# ============================================================
+
+MIN_GROUP_ROWS = 30   # 업종·자치구별 오분류율을 계산할 때 필요한 최소 검증 행 수
+
+
+def clean_feature_name(name):
+    """전처리기가 만든 열 이름을 읽기 쉽게 바꾼다. (num__직전_증감률 -> 직전_증감률)"""
+
+    name = name.replace("num__", "").replace("cat__", "")
+    name = name.replace("서비스_업종_코드_명_", "업종: ")
+    name = name.replace("자치구_코드_명_", "자치구: ")
+    name = name.replace("계절_번호_", "계절: ")
+
+    return name
+
+
+def original_variable_name(name, categorical_cols):
+    """원핫 인코딩으로 쪼개진 열 이름을 원래 변수 이름으로 되돌린다."""
+
+    if name.startswith("num__"):
+        return name[len("num__"):]
+
+    raw = name[len("cat__"):] if name.startswith("cat__") else name
+
+    for col in categorical_cols:
+        if raw.startswith(col + "_"):
+            return col
+
+    return raw
+
+
+def pick_best_model(metrics):
+    """기준선을 뺀 모델 중 F1이 가장 높은 모델을 고른다 (같으면 ROC-AUC가 높은 쪽)."""
+
+    candidates = metrics[metrics["모델"] != BASELINE_NAME]
+
+    if candidates.empty:
+        candidates = metrics
+
+    best = candidates.sort_values(["F1", "ROC-AUC"], ascending=False).iloc[0]
+
+    return best["모델"], best
+
+
+def group_error_table(frame, group_col, min_rows=MIN_GROUP_ROWS):
+    """
+    그룹(업종 또는 자치구)별로 틀린 정도를 계산한다.
+    frame에는 '정답', '예측', 그리고 group_col 열이 있어야 한다.
+    검증 행이 min_rows보다 적은 그룹은 제외한다.
+    """
+
+    work = frame.copy()
+    work["틀림"] = (work["정답"] != work["예측"]).astype(int)
+    work["성장 놓침"] = ((work["정답"] == 1) & (work["예측"] == 0)).astype(int)
+    work["잘못 성장 예측"] = ((work["정답"] == 0) & (work["예측"] == 1)).astype(int)
+
+    grouped = work.groupby(group_col).agg(
+        **{
+            "검증 행 수": ("틀림", "size"),
+            "틀린 수": ("틀림", "sum"),
+            "성장 놓침": ("성장 놓침", "sum"),
+            "잘못 성장 예측": ("잘못 성장 예측", "sum"),
+            "실제 성장 비율(%)": ("정답", "mean"),
+        }
+    )
+
+    grouped = grouped[grouped["검증 행 수"] >= min_rows].copy()
+    grouped["오분류율(%)"] = grouped["틀린 수"] / grouped["검증 행 수"] * 100
+    grouped["실제 성장 비율(%)"] = grouped["실제 성장 비율(%)"] * 100
+
+    return grouped.reset_index()
+
+
+def page_interpret(df):
+
+    st.subheader("8. 결과 해석")
+
+    # 6단계에서 학습한 결과가 없으면 안내만 보여 주고 끝낸다
+    if (
+        "trained_models" not in st.session_state
+        or "valid_predictions" not in st.session_state
+    ):
+
+        st.warning(
+            "아직 학습된 모델이 없어요. 먼저 왼쪽 메뉴에서 '6. 모델 학습'으로 가서 "
+            "'모델 학습하기' 버튼을 눌러 주세요."
+        )
+
+        return
+
+    # 처음 한 번만: 직접 저장해 둔 글이 있으면 그것을, 없으면 미리 써 둔 글을 글상자에 넣는다
+    if "interpret_note" not in st.session_state:
+
+        saved_note = load_note(INTERPRET_JSON)
+
+        st.session_state["interpret_note"] = (
+            saved_note if saved_note.strip() else DEFAULT_INTERPRET_NOTE
+        )
+
+    models = st.session_state["trained_models"]
+    predictions = st.session_state["valid_predictions"]
+
+    try:
+        split = split_train_valid(df)
+    except ValueError as e:
+        st.error(str(e))
+        return
+
+    # 예측값이 지금의 검증용 데이터와 같은 순서인지 확인 (업종·자치구를 붙여야 해서)
+    aligned = (
+        len(predictions) == len(split["X_valid"])
+        and (predictions["정답"].values == split["y_valid"].values).all()
+        and (predictions["기준_년분기_코드"].values == split["q_valid"].values).all()
+    )
+
+    if not aligned:
+
+        st.error(
+            "저장된 예측값과 현재 검증용 데이터가 맞지 않아요. 6단계에서 다시 학습해 주세요."
+        )
+
+        return
+
+    metrics, _, model_names = evaluate_models(predictions)
+
+    st.write(
+        "모델이 **무엇을 근거로 예측했는지**, 그리고 **어디에서 특히 틀렸는지**를 살펴봐요."
+    )
+
+    # --------------------------------------------------------
+    # 1) 로지스틱 회귀 계수
+    # --------------------------------------------------------
+
+    st.markdown("### 1) 로지스틱 회귀 계수: 성장에 플러스·마이너스로 작용한 변수")
+
+    if "로지스틱 회귀" not in models:
+
+        st.info("로지스틱 회귀 모델이 없어서 계수를 볼 수 없어요.")
+
+    else:
+
+        lr_pipeline = models["로지스틱 회귀"]
+        lr_names = lr_pipeline.named_steps["preprocess"].get_feature_names_out()
+        lr_coef = lr_pipeline.named_steps["model"].coef_[0]
+
+        coef_table = pd.DataFrame(
+            {
+                "변수": [clean_feature_name(n) for n in lr_names],
+                "계수": lr_coef,
+            }
+        )
+
+        top_plus = coef_table.nlargest(10, "계수")
+        top_minus = coef_table.nsmallest(10, "계수")
+
+        fig_plus = px.bar(
+            top_plus,
+            x="계수",
+            y="변수",
+            orientation="h",
+            title="성장에 플러스로 작용한 변수 상위 10개",
+        )
+        # 계수가 큰 변수가 맨 위에 오도록 정렬
+        fig_plus.update_yaxes(categoryorder="total ascending", title_text="")
+        fig_plus.update_traces(texttemplate="%{x:.2f}", textposition="outside")
+
+        fig_minus = px.bar(
+            top_minus,
+            x="계수",
+            y="변수",
+            orientation="h",
+            title="성장에 마이너스로 작용한 변수 상위 10개",
+        )
+        # 계수가 가장 작은(가장 마이너스인) 변수가 맨 위에 오도록 정렬
+        fig_minus.update_yaxes(categoryorder="total descending", title_text="")
+        fig_minus.update_traces(texttemplate="%{x:.2f}", textposition="outside")
+
+        st.plotly_chart(fig_plus)
+        st.plotly_chart(fig_minus)
+
+        st.caption(
+            "계수가 +이면 그 변수가 클수록(또는 해당 범주일수록) 성장(1) 확률이 올라가고, −이면 내려가요. "
+            "숫자 변수는 표준화돼 있어서 '1 표준편차 증가'당 효과이고, 업종·자치구·계절은 '해당 범주인 경우'의 효과예요. "
+            "연령대·시간대 비중처럼 서로 합이 1인 변수들은 계수가 함께 움직이므로 하나씩 떼어 해석하는 데는 조심해야 해요."
+        )
+
+    # --------------------------------------------------------
+    # 2) 랜덤포레스트 변수 중요도
+    # --------------------------------------------------------
+
+    st.markdown("### 2) 랜덤포레스트 변수 중요도")
+
+    if "랜덤포레스트" not in models:
+
+        st.info("랜덤포레스트 모델이 없어서 변수 중요도를 볼 수 없어요.")
+
+    else:
+
+        rf_pipeline = models["랜덤포레스트"]
+        rf_names = rf_pipeline.named_steps["preprocess"].get_feature_names_out()
+        rf_importance = rf_pipeline.named_steps["model"].feature_importances_
+
+        importance_table = pd.DataFrame(
+            {
+                "열 이름": list(rf_names),
+                "변수": [clean_feature_name(n) for n in rf_names],
+                "중요도": rf_importance,
+            }
+        )
+
+        top_importance = importance_table.nlargest(10, "중요도")
+
+        fig_imp = px.bar(
+            top_importance,
+            x="중요도",
+            y="변수",
+            orientation="h",
+            title="변수 중요도 상위 10개 (원핫 인코딩 열 기준)",
+        )
+        fig_imp.update_yaxes(categoryorder="total ascending", title_text="")
+        fig_imp.update_traces(texttemplate="%{x:.3f}", textposition="outside")
+
+        st.plotly_chart(fig_imp)
+
+        # 원핫으로 쪼개진 열을 원래 변수 단위로 합쳐서 보기
+        categorical_cols = split["categorical_cols"]
+
+        importance_table["원래 변수"] = [
+            original_variable_name(n, categorical_cols)
+            for n in importance_table["열 이름"]
+        ]
+
+        by_variable = (
+            importance_table.groupby("원래 변수", as_index=False)["중요도"]
+            .sum()
+            .sort_values("중요도", ascending=False)
+        )
+        by_variable["중요도 합계(%)"] = by_variable["중요도"] * 100
+        by_variable = by_variable[["원래 변수", "중요도 합계(%)"]].round(2)
+
+        st.markdown("#### 원래 변수 단위로 합친 중요도")
+
+        st.dataframe(
+            by_variable,
+            hide_index=True,
+            height=(len(by_variable) + 1) * 35 + 3,
+        )
+
+        st.caption(
+            "업종·자치구·계절은 범주마다 열이 쪼개져 있어서 한 열씩 보면 중요도가 작아 보여요. "
+            "원래 변수 단위로 합치면 변수 전체의 기여도를 비교할 수 있어요. "
+            "다만 이 중요도는 트리가 값을 나눌 때 쓴 횟수와 효과를 센 것이라, "
+            "값의 종류가 많은 연속형 변수가 크게 나오는 경향이 있어요."
+        )
+
+    # --------------------------------------------------------
+    # 가장 성능이 좋은 모델 고르기 (3, 4번에서 사용)
+    # --------------------------------------------------------
+
+    best_name, best_row = pick_best_model(metrics)
+
+    valid_info = split["X_valid"][["서비스_업종_코드_명", "자치구_코드_명"]].reset_index(drop=True)
+    valid_info["정답"] = predictions["정답"].values
+
+    # --------------------------------------------------------
+    # 3) 업종별 오분류율
+    # --------------------------------------------------------
+
+    st.markdown("### 3) 업종별 오분류율: 가장 많이 틀린 업종 5개")
+
+    st.info(
+        f"성능이 가장 좋은 모델은 **{best_name}**이에요 "
+        f"(F1 {best_row['F1']:.3f}, ROC-AUC {best_row['ROC-AUC']:.3f}). "
+        f"검증 행이 {MIN_GROUP_ROWS}개 미만인 업종은 제외했고, 이 모델의 오분류율 기준으로 정렬했어요."
+    )
+
+    compare_models = [n for n in model_names if n != BASELINE_NAME]
+
+    rates = {}
+
+    for name in compare_models:
+
+        frame = valid_info.copy()
+        frame["예측"] = predictions[f"{name}_예측"].values
+        rates[name] = group_error_table(frame, "서비스_업종_코드_명")
+
+    best_frame = valid_info.copy()
+    best_frame["예측"] = predictions[f"{best_name}_예측"].values
+
+    industry_best = group_error_table(best_frame, "서비스_업종_코드_명")
+
+    industry_top5 = industry_best.sort_values(
+        ["오분류율(%)", "검증 행 수"], ascending=[False, False]
+    ).head(5)
+
+    industry_view = industry_top5[
+        ["서비스_업종_코드_명", "검증 행 수", "실제 성장 비율(%)"]
+    ].copy()
+
+    for name in compare_models:
+
+        lookup = rates[name].set_index("서비스_업종_코드_명")["오분류율(%)"]
+        industry_view[f"{name} 오분류율(%)"] = industry_view["서비스_업종_코드_명"].map(lookup)
+
+    industry_view = industry_view.rename(columns={"서비스_업종_코드_명": "업종"})
+
+    st.dataframe(
+        industry_view.round(1),
+        hide_index=True,
+    )
+
+    overall_error = float((predictions["정답"] != predictions[f"{best_name}_예측"]).mean() * 100)
+
+    st.caption(
+        f"{best_name}의 전체 오분류율은 {overall_error:.1f}%예요. "
+        "업종마다 검증 행이 100개 안팎이라 오분류율의 우연 오차(표준오차)가 약 5%p예요. "
+        "63개 업종 중에서 가장 나쁜 5개를 고른 것이라, 순위 차이가 작으면 우연일 수 있어요."
+    )
+
+    # --------------------------------------------------------
+    # 4) 가장 성능이 좋은 모델의 약점 (업종·자치구)
+    # --------------------------------------------------------
+
+    st.markdown(f"### 4) {best_name}이(가) 특히 약한 업종·자치구")
+
+    district_best = group_error_table(best_frame, "자치구_코드_명")
+
+    district_top5 = district_best.sort_values(
+        ["오분류율(%)", "검증 행 수"], ascending=[False, False]
+    ).head(5)
+
+    def weak_rows(table, kind, name_col):
+
+        out = table[
+            [name_col, "검증 행 수", "틀린 수", "오분류율(%)", "성장 놓침", "잘못 성장 예측", "실제 성장 비율(%)"]
+        ].copy()
+        out.insert(0, "구분", kind)
+        out = out.rename(columns={name_col: "이름"})
+        out["평균 대비(%p)"] = out["오분류율(%)"] - overall_error
+        out["주된 오류"] = [
+            "성장 업종을 놓침" if m > w else "하락인데 성장으로 예측"
+            for m, w in zip(out["성장 놓침"], out["잘못 성장 예측"])
+        ]
+
+        return out
+
+    weak_table = pd.concat(
+        [
+            weak_rows(industry_top5, "업종", "서비스_업종_코드_명"),
+            weak_rows(district_top5, "자치구", "자치구_코드_명"),
+        ],
+        ignore_index=True,
+    )
+
+    weak_table = weak_table[
+        [
+            "구분", "이름", "검증 행 수", "틀린 수", "오분류율(%)", "평균 대비(%p)",
+            "성장 놓침", "잘못 성장 예측", "주된 오류", "실제 성장 비율(%)",
+        ]
+    ]
+
+    st.dataframe(
+        weak_table.round(1),
+        hide_index=True,
+    )
+
+    st.caption(
+        "성장 놓침: 실제로는 성장했는데 하락으로 예측한 수 / 잘못 성장 예측: 실제로는 하락인데 성장으로 예측한 수. "
+        "평균 대비는 모델 전체 오분류율과의 차이예요. 자치구는 검증 행이 약 240개라 우연 오차(표준오차)가 약 3%p로 업종보다 작아요."
+    )
+
+    # --------------------------------------------------------
+    # 5) 경영적 시사점과 한계
+    # --------------------------------------------------------
+
+    st.markdown("### 경영적 시사점과 한계")
+
+    st.caption(
+        "이번 분석 결과를 바탕으로 미리 써 둔 글이에요. 자유롭게 고쳐 쓰고 저장할 수 있어요. "
+        "(수치는 이번 학습 결과 기준이라, 데이터나 설정을 바꿨다면 확인해서 고쳐 주세요.)"
+    )
+
+    st.text_area(
+        "경영적 시사점과 한계",
+        key="interpret_note",
+        height=520,
+        label_visibility="collapsed",
+    )
+
+    if st.button(
+        "시사점과 한계 저장",
+        key="save_interpret_note"
+    ):
+
+        if save_record(
+            {"note": st.session_state["interpret_note"]},
+            INTERPRET_JSON,
+        ):
+
+            st.success("저장했어요.")
+
+
+# ============================================================
 # 앱 실행 부분
 # ============================================================
 
@@ -2137,6 +2557,7 @@ PAGES = {
     "5. 데이터 나누기": page_split,
     "6. 모델 학습": page_train,
     "7. 모델 평가": page_eval,
+    "8. 결과 해석": page_interpret,
 }
 
 st.sidebar.title(
