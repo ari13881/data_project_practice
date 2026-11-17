@@ -836,34 +836,8 @@ def safe_log1p(value):
     return math.log1p(value) if value > 0 else 0.0
 
 
-@st.cache_data
-def make_feature_data(df):
-    """
-    성장여부를 예측할 입력 변수를 만든다.
-
-    [데이터 누수 방지 규칙]
-    입력 변수는 모두 '직전 분기'(예측 대상 분기보다 1분기 앞) 또는
-    '전전 분기'(2분기 앞) 행에서만 가져온다.
-    예측 대상 분기(당월)의 금액·건수는 입력에 절대 넣지 않는다.
-
-    돌려주는 값: 딕셔너리 (data, feature_cols, info, stats)
-    """
-
-    # 3단계에서 만든 라벨 데이터 (예측 대상 분기 한 줄이 한 행)
-    labeled, label_stats = make_label_data(df)
-
-    keys = ["자치구_코드", "서비스_업종_코드"]
-
-    # 3단계와 똑같은 방식으로 분기 번호를 만들고 겹치는 행을 제거
-    work = df.copy()
-    work["분기번호"] = (
-        (work["기준_년분기_코드"] // 10) * 4
-        + (work["기준_년분기_코드"] % 10)
-    )
-    work = work.drop_duplicates(
-        subset=keys + ["분기번호"],
-        keep="first"
-    )
+def find_source_columns(df):
+    """입력 변수를 만드는 데 필요한 열을 찾는다. (4단계와 9단계가 함께 사용)"""
 
     # 입력 변수를 만드는 데 필요한 열 찾기
     age_cols = [
@@ -892,33 +866,19 @@ def make_feature_data(df):
             f"없는 열: {missing}, 연령대 열 {len(age_cols)}개, 시간대 열 {len(time_cols)}개"
         )
 
-    # 예측 대상 행의 기본 정보 (여기에는 당월 금액을 가져오지 않는다)
-    # 직전분기_매출_금액은 3단계에서 구한 값이고, 아래 점검용으로만 쓴다
-    base = labeled[
-        ["기준_년분기_코드", "분기번호"] + keys
-        + ["자치구_코드_명", "서비스_업종_코드_명", "직전분기_매출_금액", "성장여부"]
-    ].copy()
+    return age_cols, time_cols, need_cols
 
-    # ----- 직전 분기 행 붙이기 (분기번호가 정확히 1 작은 행) -----
-    p1 = work[keys + ["분기번호"] + need_cols].copy()
-    p1["직전분기번호"] = p1["분기번호"]          # 원래 분기 번호를 점검용으로 보관
-    p1["분기번호"] = p1["분기번호"] + 1          # 다음 분기 행과 짝이 맞도록 옮김
-    p1 = p1.rename(columns={c: f"p1_{c}" for c in need_cols})
 
-    merged = base.merge(p1, on=keys + ["분기번호"], how="left")
+def build_features(data, age_cols, time_cols):
+    """
+    직전 분기(p1_ 열)와 전전 분기 매출(p2_당월_매출_금액) 열이 붙은 표에서 입력 변수를 만든다.
+    4단계(학습·검증 데이터)와 9단계(다음 분기 예측)가 똑같은 방식으로 변수를 만들도록 함께 사용한다.
 
-    # ----- 전전 분기 행 붙이기 (분기번호가 정확히 2 작은 행, 매출만 필요) -----
-    p2 = work[keys + ["분기번호", "당월_매출_금액"]].copy()
-    p2["전전분기번호"] = p2["분기번호"]
-    p2["분기번호"] = p2["분기번호"] + 2
-    p2 = p2.rename(columns={"당월_매출_금액": "p2_당월_매출_금액"})
+    data에는 p1_ 열들, p2_당월_매출_금액, 기준_년분기_코드(예측 대상 분기),
+    서비스_업종_코드_명, 자치구_코드_명이 있어야 한다.
 
-    merged = merged.merge(p2, on=keys + ["분기번호"], how="left")
-
-    # 전전 분기가 없는 행은 제외 (직전 분기 증감률을 구할 수 없음)
-    has_p2 = merged["p2_당월_매출_금액"].notna()
-    excluded_no_p2 = int((~has_p2).sum())
-    data = merged[has_p2].reset_index(drop=True)
+    돌려주는 값: (입력 변수 표, 변수 설명 목록, 입력 변수 이름 목록)
+    """
 
     # ----- 입력 변수 만들기 -----
     feat = pd.DataFrame(index=data.index)
@@ -1001,6 +961,72 @@ def make_feature_data(df):
     )
 
     feature_cols = list(feat.columns)
+
+    return feat, info, feature_cols
+
+
+@st.cache_data
+def make_feature_data(df):
+    """
+    성장여부를 예측할 입력 변수를 만든다.
+
+    [데이터 누수 방지 규칙]
+    입력 변수는 모두 '직전 분기'(예측 대상 분기보다 1분기 앞) 또는
+    '전전 분기'(2분기 앞) 행에서만 가져온다.
+    예측 대상 분기(당월)의 금액·건수는 입력에 절대 넣지 않는다.
+
+    돌려주는 값: 딕셔너리 (data, feature_cols, info, stats)
+    """
+
+    # 3단계에서 만든 라벨 데이터 (예측 대상 분기 한 줄이 한 행)
+    labeled, label_stats = make_label_data(df)
+
+    keys = ["자치구_코드", "서비스_업종_코드"]
+
+    # 3단계와 똑같은 방식으로 분기 번호를 만들고 겹치는 행을 제거
+    work = df.copy()
+    work["분기번호"] = (
+        (work["기준_년분기_코드"] // 10) * 4
+        + (work["기준_년분기_코드"] % 10)
+    )
+    work = work.drop_duplicates(
+        subset=keys + ["분기번호"],
+        keep="first"
+    )
+
+    # 입력 변수를 만드는 데 필요한 열 찾기
+    age_cols, time_cols, need_cols = find_source_columns(df)
+
+    # 예측 대상 행의 기본 정보 (여기에는 당월 금액을 가져오지 않는다)
+    # 직전분기_매출_금액은 3단계에서 구한 값이고, 아래 점검용으로만 쓴다
+    base = labeled[
+        ["기준_년분기_코드", "분기번호"] + keys
+        + ["자치구_코드_명", "서비스_업종_코드_명", "직전분기_매출_금액", "성장여부"]
+    ].copy()
+
+    # ----- 직전 분기 행 붙이기 (분기번호가 정확히 1 작은 행) -----
+    p1 = work[keys + ["분기번호"] + need_cols].copy()
+    p1["직전분기번호"] = p1["분기번호"]          # 원래 분기 번호를 점검용으로 보관
+    p1["분기번호"] = p1["분기번호"] + 1          # 다음 분기 행과 짝이 맞도록 옮김
+    p1 = p1.rename(columns={c: f"p1_{c}" for c in need_cols})
+
+    merged = base.merge(p1, on=keys + ["분기번호"], how="left")
+
+    # ----- 전전 분기 행 붙이기 (분기번호가 정확히 2 작은 행, 매출만 필요) -----
+    p2 = work[keys + ["분기번호", "당월_매출_금액"]].copy()
+    p2["전전분기번호"] = p2["분기번호"]
+    p2["분기번호"] = p2["분기번호"] + 2
+    p2 = p2.rename(columns={"당월_매출_금액": "p2_당월_매출_금액"})
+
+    merged = merged.merge(p2, on=keys + ["분기번호"], how="left")
+
+    # 전전 분기가 없는 행은 제외 (직전 분기 증감률을 구할 수 없음)
+    has_p2 = merged["p2_당월_매출_금액"].notna()
+    excluded_no_p2 = int((~has_p2).sum())
+    data = merged[has_p2].reset_index(drop=True)
+
+    # ----- 입력 변수 만들기 -----
+    feat, info, feature_cols = build_features(data, age_cols, time_cols)
 
     out = pd.concat(
         [
@@ -1198,6 +1224,17 @@ def page_features(df):
 # 5. 데이터 나누기와 전처리
 # ============================================================
 
+def season_to_category(X):
+    """계절_번호(1~4)를 '1분기' 같은 글자로 바꿔 범주로 다룬다. (5단계와 9단계가 함께 사용)"""
+
+    X = X.copy()
+
+    if "계절_번호" in X.columns:
+        X["계절_번호"] = X["계절_번호"].astype(str) + "분기"
+
+    return X
+
+
 @st.cache_data
 def split_train_valid(df):
     """
@@ -1221,11 +1258,8 @@ def split_train_valid(df):
     is_train = quarter <= TRAIN_LAST_QUARTER
     is_valid = quarter.isin(VALID_QUARTERS)
 
-    X = data[feature_cols].copy()
-
     # 계절 번호는 크기의 의미가 없는 범주이므로 글자('1분기' 등)로 바꿔서 범주로 다룬다
-    if "계절_번호" in X.columns:
-        X["계절_번호"] = X["계절_번호"].astype(str) + "분기"
+    X = season_to_category(data[feature_cols])
 
     X_train = X[is_train].reset_index(drop=True)
     X_valid = X[is_valid].reset_index(drop=True)
@@ -2465,6 +2499,307 @@ def page_interpret(df):
 
 
 # ============================================================
+# 9. 예측 체험
+# ============================================================
+
+def quarter_no_to_code(no):
+    """분기 번호(연도 × 4 + 분기)를 분기 코드로 되돌린다. (8106 -> 20262)"""
+
+    year = (no - 1) // 4
+    quarter = (no - 1) % 4 + 1
+
+    return year * 10 + quarter
+
+
+@st.cache_data
+def make_next_quarter_features(df):
+    """
+    가장 최근 분기를 '직전 분기', 그 바로 앞 분기를 '전전 분기'로 삼아
+    다음 분기(예측 대상)의 입력 변수를 (자치구, 업종) 조합마다 만든다.
+    입력 변수는 4단계와 똑같은 함수(build_features)로 만든다.
+    """
+
+    keys = ["자치구_코드", "서비스_업종_코드"]
+
+    work = df.copy()
+    work["분기번호"] = (
+        (work["기준_년분기_코드"] // 10) * 4
+        + (work["기준_년분기_코드"] % 10)
+    )
+    work = work.drop_duplicates(
+        subset=keys + ["분기번호"],
+        keep="first"
+    )
+
+    age_cols, time_cols, need_cols = find_source_columns(df)
+
+    latest_no = int(work["분기번호"].max())
+
+    # 직전 분기 행 (가장 최근 분기)
+    p1 = work[work["분기번호"] == latest_no][
+        keys + ["자치구_코드_명", "서비스_업종_코드_명"] + need_cols
+    ].copy()
+    p1 = p1.rename(columns={c: f"p1_{c}" for c in need_cols})
+
+    # 전전 분기 행 (매출만 필요)
+    p2 = work[work["분기번호"] == latest_no - 1][keys + ["당월_매출_금액"]].copy()
+    p2 = p2.rename(columns={"당월_매출_금액": "p2_당월_매출_금액"})
+
+    # 두 분기 데이터가 모두 있는 조합만 남긴다
+    data = p1.merge(p2, on=keys, how="inner").reset_index(drop=True)
+
+    # 예측 대상 분기 = 가장 최근 분기의 다음 분기 (계절 번호가 여기서 정해진다)
+    target_code = quarter_no_to_code(latest_no + 1)
+    data["기준_년분기_코드"] = target_code
+
+    feat, info, feature_cols = build_features(data, age_cols, time_cols)
+
+    out = pd.concat([data[keys], feat], axis=1)
+
+    return {
+        "data": out,
+        "feature_cols": feature_cols,
+        "latest_code": quarter_no_to_code(latest_no),
+        "prev_code": quarter_no_to_code(latest_no - 1),
+        "target_code": target_code,
+    }
+
+
+def page_predict(df):
+
+    st.subheader("9. 예측 체험")
+
+    if "trained_models" not in st.session_state:
+
+        st.warning(
+            "아직 학습된 모델이 없어요. 먼저 왼쪽 메뉴에서 '6. 모델 학습'으로 가서 "
+            "'모델 학습하기' 버튼을 눌러 주세요."
+        )
+
+        return
+
+    models = st.session_state["trained_models"]
+
+    try:
+        nxt = make_next_quarter_features(df)
+    except ValueError as e:
+        st.error(str(e))
+        return
+
+    latest_label = quarter_label(nxt["latest_code"])
+    prev_label = quarter_label(nxt["prev_code"])
+    target_label = quarter_label(nxt["target_code"])
+
+    st.write(
+        f"자치구와 업종을 고르면, 가장 최근 분기({latest_label})를 직전 분기로 삼아 "
+        f"**{target_label}에 매출이 직전 분기보다 늘어날 확률**을 계산해요. "
+        f"(전전 분기는 {prev_label}이에요.)"
+    )
+
+    # --------------------------------------------------------
+    # 모델·자치구·업종 고르기
+    # --------------------------------------------------------
+
+    model_names = [n for n in MODEL_NAMES if n in models]
+
+    # 기본 선택은 가장 성능이 좋은 모델 (평가 지표가 있을 때)
+    default_model_index = 0
+
+    if "valid_predictions" in st.session_state:
+
+        metrics, _, _ = evaluate_models(st.session_state["valid_predictions"])
+        best_name, _ = pick_best_model(metrics)
+
+        if best_name in model_names:
+            default_model_index = model_names.index(best_name)
+
+    else:
+
+        metrics = None
+
+    district_list = sorted(df["자치구_코드_명"].unique())
+    industry_list = sorted(df["서비스_업종_코드_명"].unique())
+
+    default_industry_index = (
+        industry_list.index("한식음식점") if "한식음식점" in industry_list else 0
+    )
+
+    cols = st.columns(3)
+
+    with cols[0]:
+        model_name = st.selectbox(
+            "사용할 모델",
+            model_names,
+            index=default_model_index,
+            key="predict_model",
+        )
+
+    with cols[1]:
+        district = st.selectbox(
+            "자치구",
+            district_list,
+            key="predict_district",
+        )
+
+    with cols[2]:
+        industry = st.selectbox(
+            "업종",
+            industry_list,
+            index=default_industry_index,
+            key="predict_industry",
+        )
+
+    # --------------------------------------------------------
+    # 데이터가 있는 조합인지 확인 (없으면 이유를 안내)
+    # --------------------------------------------------------
+
+    pair_rows = df[
+        (df["자치구_코드_명"] == district)
+        & (df["서비스_업종_코드_명"] == industry)
+    ]
+
+    pair_quarters = set(pair_rows["기준_년분기_코드"])
+
+    if pair_rows.empty:
+
+        st.error(
+            f"{district}에는 '{industry}' 업종 데이터가 아예 없어서 예측할 수 없어요."
+        )
+
+        return
+
+    if nxt["latest_code"] not in pair_quarters:
+
+        st.error(
+            f"{district}의 '{industry}'은(는) 가장 최근 분기({latest_label}) 데이터가 없어서 "
+            "직전 분기 정보를 만들 수 없어요."
+        )
+
+        return
+
+    if nxt["prev_code"] not in pair_quarters:
+
+        st.error(
+            f"{district}의 '{industry}'은(는) 전전 분기({prev_label}) 데이터가 없어서 "
+            "직전 분기 증감률을 만들 수 없어요."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # 예측하기
+    # --------------------------------------------------------
+
+    all_inputs = nxt["data"]
+
+    row = all_inputs[
+        (all_inputs["자치구_코드_명"] == district)
+        & (all_inputs["서비스_업종_코드_명"] == industry)
+    ]
+
+    if row.empty:
+
+        st.error("이 조합의 입력 변수를 만들지 못했어요. 데이터를 확인해 주세요.")
+
+        return
+
+    row = row.head(1)
+
+    model = models[model_name]
+
+    # 학습할 때와 똑같이 계절 번호를 범주(글자)로 바꿔서 모델에 넣는다
+    X_new = season_to_category(row[nxt["feature_cols"]])
+
+    class_index = list(model.classes_).index(1)
+    growth_prob = float(model.predict_proba(X_new)[0, class_index])
+    predicted_class = int(model.predict(X_new)[0])
+
+    # ----- 결과 숫자 -----
+    st.markdown(f"### {target_label} 성장 확률")
+
+    cols = st.columns(3)
+
+    big_card(cols[0], "성장(1) 확률", f"{growth_prob * 100:.1f}%")
+    big_card(cols[1], "모델의 판단", "성장 쪽" if predicted_class == 1 else "하락·같음 쪽")
+    big_card(cols[2], "예측 대상 분기", target_label)
+
+    # ----- 막대 하나 -----
+    fig = px.bar(
+        pd.DataFrame({"구분": ["성장 확률"], "확률(%)": [growth_prob * 100]}),
+        x="확률(%)",
+        y="구분",
+        orientation="h",
+        title=f"{district} · {industry} ({model_name})",
+    )
+    fig.update_xaxes(range=[0, 100], title_text="확률(%)")
+    fig.update_yaxes(title_text="")
+    fig.update_traces(
+        texttemplate="%{x:.1f}%",
+        textposition="inside",
+    )
+    fig.add_vline(x=50, line_dash="dash")   # 50%: 성장과 하락을 가르는 기준
+
+    st.plotly_chart(fig)
+
+    # ----- 이 예측의 근거가 된 값 -----
+    latest_sales = float(
+        pair_rows[pair_rows["기준_년분기_코드"] == nxt["latest_code"]]["당월_매출_금액"].iloc[0]
+    )
+    prev_sales = float(
+        pair_rows[pair_rows["기준_년분기_코드"] == nxt["prev_code"]]["당월_매출_금액"].iloc[0]
+    )
+    change = float(row["직전_증감률"].iloc[0])
+
+    st.caption(
+        f"{prev_label} 매출 {prev_sales / 1e8:,.1f}억 원 → {latest_label} 매출 {latest_sales / 1e8:,.1f}억 원 "
+        f"(직전 증감률 {change * 100:+.1f}%)을 포함한 입력 변수로 계산했어요."
+    )
+
+    if model_name == BASELINE_NAME:
+
+        st.caption(
+            "기준선(Dummy)은 어떤 입력이 와도 학습용에서 더 많았던 '하락' 쪽으로만 찍는 모델이라 "
+            "성장 확률이 항상 0%로 나와요. 비교용으로만 봐 주세요."
+        )
+
+    with st.expander("예측에 쓴 입력 변수 값 보기"):
+
+        values = row[nxt["feature_cols"]].iloc[0]
+
+        value_table = pd.DataFrame(
+            {
+                "변수 이름": nxt["feature_cols"],
+                "값": [
+                    f"{v:,.4f}" if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)
+                    for v in values.tolist()
+                ],
+            }
+        )
+
+        st.dataframe(value_table, hide_index=True)
+
+    # ----- 성능에 한계가 있다는 안내문 -----
+    if metrics is not None and model_name in set(metrics["모델"]):
+
+        mrow = metrics[metrics["모델"] == model_name].iloc[0]
+
+        performance = (
+            f"선택한 {model_name}은(는) 검증용에서 정확도 {mrow['정확도'] * 100:.1f}%, "
+            f"ROC-AUC {mrow['ROC-AUC']:.3f}였어요. "
+        )
+
+    else:
+
+        performance = ""
+
+    st.warning(
+        "이 결과는 참고용이에요. " + performance +
+        "과거 패턴으로 계산한 확률일 뿐 실제 성장을 보장하지 않고, "
+        "열 번 중 세 번 가까이는 틀릴 수 있어요. 업종에 따라서는 더 잘 틀리기도 해요(8단계 참고)."
+    )
+
+
+# ============================================================
 # 앱 실행 부분
 # ============================================================
 
@@ -2558,6 +2893,7 @@ PAGES = {
     "6. 모델 학습": page_train,
     "7. 모델 평가": page_eval,
     "8. 결과 해석": page_interpret,
+    "9. 예측 체험": page_predict,
 }
 
 st.sidebar.title(
